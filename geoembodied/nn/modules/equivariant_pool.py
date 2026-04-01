@@ -94,7 +94,6 @@ class EquivariantPool(nn.Module):
         # This breaks the "softmax ice" where logit range is too small.
         self.log_temperature = nn.Parameter(torch.zeros(1))
 
-    @torch.autocast(device_type='cuda', enabled=False)
     def forward(
         self,
         pos: Tensor,
@@ -126,6 +125,13 @@ class EquivariantPool(nn.Module):
             fps_idx: FPS selected indices (global, into original)
                 shape: [N_out], int64
         """
+        # Force FP32 for geometric computations (norm, sqrt, cosine).
+        # Under AMP, inputs may be FP16 but these ops need full precision.
+        input_dtype = scalars.dtype
+        pos = pos.float()
+        scalars = scalars.float()
+        vectors = vectors.float()
+
         B = ptr.shape[0] - 1
         device = pos.device
 
@@ -274,7 +280,7 @@ class EquivariantPool(nn.Module):
             s_out[all_invalid] = 0.0
             v_out[all_invalid] = 0.0
 
-        return seed_pos, s_out, v_out, ptr_out, fps_idx
+        return seed_pos, s_out.to(input_dtype), v_out.to(input_dtype), ptr_out, fps_idx
 
     def extra_repr(self) -> str:
         return (

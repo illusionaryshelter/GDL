@@ -103,7 +103,6 @@ class EquivariantLayerNorm(nn.Module):
             self.register_buffer('num_batches_tracked', None)
             self.register_parameter('vector_weight', None)
 
-    @torch.autocast(device_type='cuda', enabled=False)
     def forward(
         self,
         scalars: Tensor,
@@ -121,6 +120,13 @@ class EquivariantLayerNorm(nn.Module):
         Returns:
             Tuple of (normalized_scalars, normalized_vectors)
         """
+        # Force FP32 for numerical safety (sqrt, pow, var).
+        # Under AMP autocast, inputs may arrive as FP16. We cast to FP32
+        # for the computation and return results in the original dtype.
+        input_dtype = scalars.dtype
+        scalars = scalars.float()
+        vectors = vectors.float()
+
         # ── Scalar normalization (per-point LayerNorm) ──
         s_mean = scalars.mean(dim=-1, keepdim=True)
         s_var = scalars.var(dim=-1, keepdim=True, unbiased=False)
@@ -182,7 +188,7 @@ class EquivariantLayerNorm(nn.Module):
         else:
             vectors_out = vectors
 
-        return scalars_out, vectors_out
+        return scalars_out.to(input_dtype), vectors_out.to(input_dtype)
 
     def extra_repr(self) -> str:
         return (
