@@ -158,6 +158,7 @@ def train_one_epoch(
     use_amp: bool = True,
     diag_every: int = 50,
     grad_clip: float = 1.0,
+    amp_max_scale: float = 2**15,
 ) -> Tuple[float, float, dict]:
     """Train for one epoch.
 
@@ -215,6 +216,14 @@ def train_one_epoch(
                 )
             scaler.step(optimizer)
             scaler.update()
+
+            # Cap GradScaler to prevent FP16 gradient overflow.
+            # At scale S, any FP32 gradient > 65504/S overflows to Inf
+            # in FP16, causing silent step-skipping. With cap=32768,
+            # gradients up to 2.0 are safe (65504/32768 ≈ 2.0).
+            if scaler.is_enabled() and scaler.get_scale() > amp_max_scale:
+                scaler._scale.fill_(amp_max_scale)
+
             optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.item() * accum_steps
@@ -233,7 +242,10 @@ def train_one_epoch(
     for k, vals in diag_accum.items():
         avg_diag[k] = sum(vals) / len(vals) if vals else 0.0
 
-    return avg_loss, avg_acc, avg_diag
+    # Track scaler state for monitoring
+    scaler_scale = scaler.get_scale() if scaler.is_enabled() else 0.0
+
+    return avg_loss, avg_acc, avg_diag, scaler_scale
 
 
 @torch.no_grad()
@@ -399,7 +411,10 @@ def main() -> None:
         optimizer, T_max=args.epochs, eta_min=1e-5
     )
 
-    scaler = GradScaler('cuda', enabled=use_amp)
+    # AMP GradScaler with conservative settings.
+    # init_scale=2^14 avoids early overflow; growth is capped at 2^15
+    # in train_one_epoch to keep max safe FP16 gradient ≥ 2.0.
+    scaler = GradScaler('cuda', enabled=use_amp, init_scale=2**14)
 
     # ── Profiling mode ──
     if args.profile:
@@ -415,7 +430,7 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
 
-        train_loss, train_acc, diag = train_one_epoch(
+        train_loss, train_acc, diag, scaler_scale = train_one_epoch(
             model, train_loader, optimizer, scaler, device,
             accum_steps=args.accum_steps, use_amp=use_amp,
             grad_clip=args.grad_clip,
@@ -439,6 +454,8 @@ def main() -> None:
         diag_log = (f"  ├─ v_norm={v_norm:.4f}±{v_std:.4f} | "
                     f"attn: entropy={attn_ent:.3f} max={attn_max:.3f} "
                     f"uniform={attn_uni:.2f}")
+        if scaler_scale > 0:
+            diag_log += f" | amp_scale={scaler_scale:.0f}"
 
         # Evaluate periodically
         if epoch % args.eval_every == 0 or epoch == args.epochs:
