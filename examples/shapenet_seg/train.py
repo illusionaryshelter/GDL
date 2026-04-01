@@ -420,10 +420,12 @@ def main() -> None:
         optimizer, T_max=args.epochs, eta_min=1e-5
     )
 
-    # AMP GradScaler with conservative settings.
-    # init_scale=2^14 avoids early overflow; growth is capped at 2^15
-    # in train_one_epoch to keep max safe FP16 gradient ≥ 2.0.
-    scaler = GradScaler('cuda', enabled=use_amp, init_scale=2**14)
+    # AMP GradScaler: start at the model's natural scale (2^9=512).
+    # SE3Conv computes in FP32 internally but backward uses FP16,
+    # producing gradients ~0.1-4.0. At scale=512, max safe FP16
+    # gradient = 65504/512 ≈ 128, leaving ample headroom.
+    # Cap at 2^15 prevents unbounded growth (see train_one_epoch).
+    scaler = GradScaler('cuda', enabled=use_amp, init_scale=2**9)
 
     # ── Profiling mode ──
     if args.profile:
