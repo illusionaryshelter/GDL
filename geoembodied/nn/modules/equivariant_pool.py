@@ -94,6 +94,7 @@ class EquivariantPool(nn.Module):
         # This breaks the "softmax ice" where logit range is too small.
         self.log_temperature = nn.Parameter(torch.zeros(1))
 
+    @torch.autocast(device_type='cuda', enabled=False)
     def forward(
         self,
         pos: Tensor,

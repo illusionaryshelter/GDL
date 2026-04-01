@@ -103,6 +103,7 @@ class EquivariantLayerNorm(nn.Module):
             self.register_buffer('num_batches_tracked', None)
             self.register_parameter('vector_weight', None)
 
+    @torch.autocast(device_type='cuda', enabled=False)
     def forward(
         self,
         scalars: Tensor,

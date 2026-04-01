@@ -402,11 +402,20 @@ def main() -> None:
     print()
 
     # ── Optimizer + Scheduler ──
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    # Standard practice (BERT/GPT/ViT): exclude 1D params (biases, norm
+    # weights, scales) from weight decay. Weight decay on these pushes
+    # them toward 0, corrupting normalization scale and gate behavior.
+    decay_params = [p for p in model.parameters()
+                    if p.requires_grad and p.ndim >= 2]
+    no_decay_params = [p for p in model.parameters()
+                       if p.requires_grad and p.ndim < 2]
+    print(f"  Param groups: {len(decay_params)} decay, "
+          f"{len(no_decay_params)} no-decay")
+
+    optimizer = optim.AdamW([
+        {'params': decay_params, 'weight_decay': args.weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0},
+    ], lr=args.lr)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5
     )
