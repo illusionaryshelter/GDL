@@ -44,6 +44,7 @@ from geoembodied.nn.modules.spatial_graph import SpatialGraph
 from geoembodied.nn.modules.equivariant_pool import EquivariantPool
 from geoembodied.nn.modules.equivariant_interp import EquivariantInterpolate
 from geoembodied.nn.modules.equivariant_norm import EquivariantLayerNorm
+from geoembodied.nn.modules.geometric_self_attention import InvariantSelfAttention
 from geoembodied.functional.knn import knn_self
 
 
@@ -69,6 +70,8 @@ class _EncoderStage(nn.Module):
         radius_multiplier: float = 4.0,
         max_num_neighbors: int = 32,
         knn_fallback_k: int = 3,
+        gate_mode: str = 'scalar',
+        use_self_tp: bool = False,
     ) -> None:
         super().__init__()
         self.channels_scalar = channels_scalar
@@ -83,6 +86,8 @@ class _EncoderStage(nn.Module):
                 channels_vector=channels_vector,
                 radius=1.0,  # placeholder, will use adaptive
                 max_num_neighbors=max_num_neighbors,
+                gate_mode=gate_mode,
+                use_self_tp=use_self_tp,
             )
             for _ in range(num_layers)
         ])
@@ -296,6 +301,10 @@ class MultiScaleSE3Net(nn.Module):
         pool_k: int = 16,
         interp_k: int = 3,
         radius_multiplier: float = 4.0,
+        gate_mode: str = 'scalar',
+        use_self_tp: bool = False,
+        use_bottleneck_attn: bool = False,
+        attn_num_heads: int = 4,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -319,6 +328,8 @@ class MultiScaleSE3Net(nn.Module):
                 channels_vector=C_v,
                 num_layers=layers_per_stage,
                 radius_multiplier=radius_multiplier,
+                gate_mode=gate_mode,
+                use_self_tp=use_self_tp,
             ))
             if i < num_stages - 1:
                 self.pool_layers.append(EquivariantPool(
@@ -353,15 +364,32 @@ class MultiScaleSE3Net(nn.Module):
                 channels_vector=C_v,
                 num_layers=layers_per_stage,
                 radius_multiplier=radius_multiplier,
+                gate_mode=gate_mode,
+                use_self_tp=use_self_tp,
             ))
 
         # ── Final Norm (Pre-Norm mandatory) ──
-        # In Pre-Norm, the residual stream is never normalized at output.
-        # Final norm ensures downstream heads see controlled-scale features.
-        # This is the equivalent of GPT-3/LLaMA's final LayerNorm.
         self.final_norm = EquivariantLayerNorm(
             num_scalars=C_s, num_vectors=C_v,
         )
+
+        # ── Bottleneck attention (optional) ──
+        # Operates ONLY on l=0 scalars at the deepest (most downsampled)
+        # encoder stage. SO(3)-invariant by construction (scalar-only +
+        # distance RPE). Uses packed→padded→packed conversion.
+        self.use_bottleneck_attn = use_bottleneck_attn
+        if use_bottleneck_attn:
+            # Ensure C_s is divisible by num_heads
+            n_heads = min(attn_num_heads, C_s)
+            while C_s % n_heads != 0:
+                n_heads -= 1
+            self.bottleneck_attn = InvariantSelfAttention(
+                channels=C_s,
+                num_heads=n_heads,
+                sigma_d=0.1,
+                n_freqs=8,
+                ffn_ratio=2,
+            )
 
     def forward(
         self,
@@ -370,6 +398,7 @@ class MultiScaleSE3Net(nn.Module):
         features: Optional[Tensor] = None,
         batch: Optional[Tensor] = None,
         v_init: Optional[Tensor] = None,
+        return_encoder_features: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Multi-scale feature extraction.
 
@@ -386,6 +415,9 @@ class MultiScaleSE3Net(nn.Module):
                 shape: [N_total, hidden_vector, 3]
                 representation: SO(3) type-1 Cartesian vectors
                 If None, vectors are zero-initialized.
+            return_encoder_features: If True, additionally return
+                per-stage encoder scalar features and their ptrs
+                for multi-scale head fusion.
 
         Returns:
             s_out: Per-point scalar features at input resolution
@@ -393,6 +425,9 @@ class MultiScaleSE3Net(nn.Module):
             v_out: Per-point vector features at input resolution
                 shape: [N_total, hidden_vector, 3]
             ptr: Original ptr (unchanged)
+            If return_encoder_features is True, also returns:
+                enc_s_list: List[Tensor] — per-stage encoder scalars
+                enc_ptr_list: List[Tensor] — per-stage batch ptrs
         """
         N = pos.shape[0]
         C_s = self.hidden_scalar
@@ -451,6 +486,36 @@ class MultiScaleSE3Net(nn.Module):
                 # Build batch vector for downsampled points
                 cur_batch = enc_batch_list[-1][fps_idx]
 
+        # ── Bottleneck attention (scalar-only, SO(3)-invariant) ──
+        if self.use_bottleneck_attn:
+            # Convert packed → padded for batched attention
+            B_bn = cur_ptr.shape[0] - 1
+            counts_bn = cur_ptr[1:] - cur_ptr[:-1]  # [B_bn]
+            N_max = counts_bn.max().item()
+
+            # Pad scalars: [N_total, C_s] → [B_bn, N_max, C_s]
+            s_padded = s.new_zeros(B_bn, N_max, s.shape[-1])
+            pos_padded = cur_pos.new_zeros(B_bn, N_max, 3)
+            mask_padded = torch.zeros(B_bn, N_max, dtype=torch.bool, device=s.device)
+
+            for b_idx in range(B_bn):
+                start = cur_ptr[b_idx].item()
+                end = cur_ptr[b_idx + 1].item()
+                n_b = end - start
+                s_padded[b_idx, :n_b] = s[start:end]
+                pos_padded[b_idx, :n_b] = cur_pos[start:end]
+                mask_padded[b_idx, :n_b] = True
+
+            # Run attention: [B, N_max, C_s] → [B, N_max, C_s]
+            s_padded = self.bottleneck_attn(s_padded, pos_padded, mask=mask_padded)
+
+            # Unpad: [B, N_max, C_s] → [N_total, C_s]
+            for b_idx in range(B_bn):
+                start = cur_ptr[b_idx].item()
+                end = cur_ptr[b_idx + 1].item()
+                n_b = end - start
+                s[start:end] = s_padded[b_idx, :n_b]
+
         # ── Decoder: upsample + skip + process ──
         for i in range(self.num_stages - 2, -1, -1):
             # Upsample from coarse to encoder resolution i
@@ -493,6 +558,8 @@ class MultiScaleSE3Net(nn.Module):
         # Final norm (Pre-Norm mandatory)
         s, v = self.final_norm(s, v)
 
+        if return_encoder_features:
+            return s, v, ptr, enc_s_list, enc_ptr_list
         return s, v, ptr
 
     def extra_repr(self) -> str:

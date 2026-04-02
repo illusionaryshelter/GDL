@@ -332,7 +332,22 @@ def main() -> None:
                         help='Profile first 5 batches and exit')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='Max gradient norm for clipping (0 to disable)')
+    parser.add_argument('--gate_mode', type=str, default='norm',
+                        choices=['scalar', 'norm'],
+                        help='Vector gate mode: scalar (sigmoid) or norm (norm-aware)')
+    parser.add_argument('--use_self_tp', action='store_true', default=True,
+                        help='Enable self-interaction TP (v·v → scalar)')
+    parser.add_argument('--no_self_tp', action='store_true',
+                        help='Disable self-interaction TP')
+    parser.add_argument('--use_bottleneck_attn', action='store_true', default=True,
+                        help='Enable bottleneck geometric attention')
+    parser.add_argument('--no_bottleneck_attn', action='store_true',
+                        help='Disable bottleneck geometric attention')
     args = parser.parse_args()
+    if args.no_self_tp:
+        args.use_self_tp = False
+    if args.no_bottleneck_attn:
+        args.use_bottleneck_attn = False
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = not args.no_amp and device.type == 'cuda'
@@ -346,6 +361,9 @@ def main() -> None:
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"AMP: {'ON' if use_amp else 'OFF'}")
     print(f"Normals: {'ON (l=1 vector features)' if use_normals else 'OFF (pos only)'}")
+    print(f"Gate mode: {args.gate_mode}")
+    print(f"Self-TP: {'ON (ν=2)' if args.use_self_tp else 'OFF (ν=1)'}")
+    print(f"Bottleneck attn: {'ON' if args.use_bottleneck_attn else 'OFF'}")
     print(f"Batch: {args.batch_size} × {args.accum_steps} accum = "
           f"{args.batch_size * args.accum_steps} effective")
     print()
@@ -391,6 +409,9 @@ def main() -> None:
         layers_per_stage=args.layers_per_stage,
         pool_ratio=args.pool_ratio,
         use_normals=use_normals,
+        gate_mode=args.gate_mode,
+        use_self_tp=args.use_self_tp,
+        use_bottleneck_attn=args.use_bottleneck_attn,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -465,8 +486,23 @@ def main() -> None:
         diag_log = (f"  ├─ v_norm={v_norm:.4f}±{v_std:.4f} | "
                     f"attn: entropy={attn_ent:.3f} max={attn_max:.3f} "
                     f"uniform={attn_uni:.2f}")
+
+        # Per-stage encoder scalar norms (multi-scale health)
+        enc_norms = []
+        for i in range(args.num_stages):
+            key = f'enc{i}_s_norm'
+            if key in diag:
+                enc_norms.append(f"s{i}={diag[key]:.3f}")
+        if enc_norms:
+            diag_log += f" | enc:[{','.join(enc_norms)}]"
+
         if scaler_scale > 0:
             diag_log += f" | amp_scale={scaler_scale:.0f}"
+
+        # VRAM tracking
+        if device.type == 'cuda':
+            vram_mb = torch.cuda.max_memory_allocated() / 1024**2
+            diag_log += f" | vram={vram_mb:.0f}MB"
 
         # Evaluate periodically
         if epoch % args.eval_every == 0 or epoch == args.epochs:

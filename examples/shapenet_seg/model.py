@@ -40,6 +40,8 @@ class SE3PartSegNet(_SE3PartSegNet):
         pool_ratio: Downsampling ratio per stage
         use_normals: If True, inject normals as initial l=1 vector features
         head_hidden: Hidden dim in classification head
+        gate_mode: Gate mode for vector nonlinearity ('scalar' or 'norm')
+        use_self_tp: Enable self-interaction tensor product (v·v → scalar)
     """
 
     def __init__(
@@ -52,6 +54,9 @@ class SE3PartSegNet(_SE3PartSegNet):
         pool_ratio: float = 0.25,
         use_normals: bool = True,
         head_hidden: int = 128,
+        gate_mode: str = 'scalar',
+        use_self_tp: bool = False,
+        use_bottleneck_attn: bool = False,
     ) -> None:
         super().__init__(
             num_categories=NUM_CATEGORIES,
@@ -65,4 +70,7 @@ class SE3PartSegNet(_SE3PartSegNet):
             pool_ratio=pool_ratio,
             use_normals=use_normals,
             head_hidden=head_hidden,
+            gate_mode=gate_mode,
+            use_self_tp=use_self_tp,
+            use_bottleneck_attn=use_bottleneck_attn,
         )

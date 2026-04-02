@@ -12,6 +12,19 @@ using scalar-derived gates:
 
 Since the gate is an SO(3)-invariant scalar, multiplying it with a vector
 preserves equivariance: R(gate * v) = gate * Rv.
+
+**Norm mode** (gate_mode='norm'):
+    Combines scalar-derived gate with norm-based activation.
+    v_out = activation(W_gate @ s + W_norm @ ||v||) * v / ||v||
+    This allows the nonlinearity to *change* vector amplitude based on
+    both scalar context AND vector magnitude, while strictly preserving
+    direction (and therefore equivariance).
+
+    Equivariance proof:
+        ||Rv|| = ||v||, so the scalar gate is invariant.
+        v/||v|| transforms as Rv/||Rv|| = R(v/||v||).
+        Therefore: gate(s, ||Rv||) * Rv/||Rv|| = gate(s, ||v||) * R(v/||v||)
+                 = R * [gate(s, ||v||) * v/||v||]  QED
 """
 
 import torch
@@ -26,7 +39,8 @@ class GatedNonlinearity(nn.Module):
     generates scalar gates from a linear projection and multiplies:
 
         s_out = activation(s_in)
-        v_out = sigmoid(W_gate @ s_in) ⊙ v_in
+        v_out = sigmoid(W_gate @ s_in) ⊙ v_in          (mode='scalar')
+        v_out = σ(W_gate @ s + W_norm @ ||v||) * v/||v|| (mode='norm')
 
     The gate values are SO(3)-invariant scalars, so the output vectors
     remain equivariant.
@@ -36,6 +50,9 @@ class GatedNonlinearity(nn.Module):
         num_vectors: Number of vector input/output channels
         scalar_activation: Activation for scalar features (default: SiLU)
         gate_activation: Activation for vector gates (default: sigmoid)
+        gate_mode: 'scalar' (default) or 'norm'
+            'scalar': gate = σ(W @ s_in)
+            'norm': gate = σ(W_s @ s_in + W_n @ ||v|| + b)
 
     Example::
 
@@ -50,10 +67,12 @@ class GatedNonlinearity(nn.Module):
         num_vectors: int = 0,
         scalar_activation: str = "silu",
         gate_activation: str = "sigmoid",
+        gate_mode: str = "scalar",
     ) -> None:
         super().__init__()
         self.num_scalars = num_scalars
         self.num_vectors = num_vectors
+        self.gate_mode = gate_mode
 
         # Scalar nonlinearity
         activations = {
@@ -74,6 +93,10 @@ class GatedNonlinearity(nn.Module):
         # Linear projection: scalar features → gate values
         if num_vectors > 0:
             self.gate_proj = nn.Linear(num_scalars, num_vectors, bias=True)
+
+            # Norm mode: additional projection from vector norms
+            if gate_mode == 'norm':
+                self.norm_proj = nn.Linear(num_vectors, num_vectors, bias=False)
         else:
             self.gate_proj = None
 
@@ -98,8 +121,22 @@ class GatedNonlinearity(nn.Module):
 
         # Vector: gate using scalar-derived values
         if self.gate_proj is not None and vectors.shape[-2] > 0:
-            gates = self.gate_act(self.gate_proj(scalars))  # [..., num_vectors]
-            v_out = vectors * gates.unsqueeze(-1)  # [..., num_vectors, 3]
+            if self.gate_mode == 'norm':
+                # Norm-based gate: combines scalar context + vector magnitude
+                # ||v||: [..., C_v] — SO(3) invariant (Rule 4: clamp for safety)
+                v_norm = vectors.norm(dim=-1).clamp(min=1e-8)  # [..., C_v]
+                v_hat = vectors / v_norm.unsqueeze(-1)  # unit direction
+
+                # Gate input: W_s @ s + W_n @ ||v||
+                gate_input = self.gate_proj(scalars) + self.norm_proj(v_norm)
+                gates = self.gate_act(gate_input)  # [..., C_v], in [0,1]
+
+                # Scale = gate * original_norm (re-modulate magnitude)
+                v_out = (gates * v_norm).unsqueeze(-1) * v_hat  # [..., C_v, 3]
+            else:
+                # Standard scalar gate
+                gates = self.gate_act(self.gate_proj(scalars))  # [..., num_vectors]
+                v_out = vectors * gates.unsqueeze(-1)  # [..., num_vectors, 3]
         else:
             v_out = vectors
 
@@ -108,5 +145,6 @@ class GatedNonlinearity(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"num_scalars={self.num_scalars}, "
-            f"num_vectors={self.num_vectors}"
+            f"num_vectors={self.num_vectors}, "
+            f"gate_mode={self.gate_mode}"
         )

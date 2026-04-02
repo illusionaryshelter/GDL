@@ -101,6 +101,9 @@ class SE3PartSegNet(nn.Module):
         pool_ratio: float = 0.25,
         use_normals: bool = True,
         head_hidden: int = 128,
+        gate_mode: str = 'scalar',
+        use_self_tp: bool = False,
+        use_bottleneck_attn: bool = False,
     ) -> None:
         super().__init__()
         self.num_categories = num_categories
@@ -108,6 +111,7 @@ class SE3PartSegNet(nn.Module):
         self.use_normals = use_normals
         self.hidden_scalar = hidden_scalar
         self.hidden_vector = hidden_vector
+        self.num_stages = num_stages
 
         # U-Net backbone
         self.backbone = MultiScaleSE3Net(
@@ -117,6 +121,9 @@ class SE3PartSegNet(nn.Module):
             num_stages=num_stages,
             layers_per_stage=layers_per_stage,
             pool_ratio=pool_ratio,
+            gate_mode=gate_mode,
+            use_self_tp=use_self_tp,
+            use_bottleneck_attn=use_bottleneck_attn,
         )
 
         # Normal vector embedding: project 3D normals → C_v vector channels
@@ -126,9 +133,10 @@ class SE3PartSegNet(nn.Module):
             self.normal_proj = nn.Linear(1, hidden_vector, bias=False)
 
         # Classification head — invariant scalars only!
-        # Input: scalar features [N, C_s] + category one-hot [N, num_categories]
+        # Input: local scalar [N, C_s] + multi-scale globals [N, num_stages * C_s]
+        #        + category one-hot [N, num_categories]
         # Output: logits [N, num_parts]
-        head_in = hidden_scalar + num_categories
+        head_in = hidden_scalar * (num_stages + 1) + num_categories
         self.head = nn.Sequential(
             nn.Linear(head_in, head_hidden),
             nn.SiLU(),
@@ -234,25 +242,48 @@ class SE3PartSegNet(nn.Module):
             if self.use_normals and normals is not None:
                 v_init = self.inject_normals(normals)  # [N, C_v, 3]
 
-            # ── 2. Run U-Net backbone ──
-            s_out, v_out, _ = self.backbone(
-                pos, ptr, features=features, v_init=v_init
+            # ── 2. Run U-Net backbone (with encoder features for multi-scale head) ──
+            backbone_out = self.backbone(
+                pos, ptr, features=features, v_init=v_init,
+                return_encoder_features=True,
             )
+            s_out, v_out, _, enc_s_list, enc_ptr_list = backbone_out
             # s_out: [N, C_s], v_out: [N, C_v, 3]
 
-            # ── 3. Build per-point category one-hot ──
-            sizes = ptr[1:] - ptr[:-1]  # [B]
-            point_cat = torch.arange(B, device=device).repeat_interleave(sizes)
-            point_cat = cat_indices[point_cat]  # [N] category indices
+            # ── 3. Build multi-scale global features ──
+            # For each encoder stage, compute per-shape mean scalar
+            # global_feats stores [B, C_s] per stage; broadcast to per-point in step 5
+            global_feats = []  # each: [B, C_s]
+            for enc_s, enc_ptr in zip(enc_s_list, enc_ptr_list):
+                B_enc = enc_ptr.shape[0] - 1
+                # Per-shape mean via vectorized scatter
+                enc_counts = enc_ptr[1:] - enc_ptr[:-1]  # [B_enc]
+                enc_batch = torch.arange(B_enc, device=device).repeat_interleave(enc_counts)
+                # Scatter mean: [N_enc, C_s] → [B_enc, C_s]
+                shape_sum = torch.zeros(B_enc, self.hidden_scalar, device=device, dtype=enc_s.dtype)
+                shape_sum.scatter_add_(0, enc_batch.unsqueeze(1).expand_as(enc_s), enc_s)
+                shape_mean = shape_sum / enc_counts.unsqueeze(1).clamp(min=1).to(enc_s.dtype)
+                global_feats.append(shape_mean)  # [B, C_s]
 
-            one_hot = torch.zeros(N, self.num_categories, device=device)
+            # ── 4. Build per-point category one-hot ──
+            sizes = ptr[1:] - ptr[:-1]  # [B]
+            point_cat_batch = torch.arange(B, device=device).repeat_interleave(sizes)
+            point_cat = cat_indices[point_cat_batch]  # [N] category indices
+
+            one_hot = torch.zeros(N, self.num_categories, device=device, dtype=s_out.dtype)
             one_hot.scatter_(1, point_cat.unsqueeze(1), 1.0)
 
-            # ── 4. Classification head (scalars + category only) ──
-            head_input = torch.cat([s_out, one_hot], dim=1)
+            # ── 5. Multi-scale global → per-point broadcast ──
+            point_globals = []
+            for g in global_feats:
+                point_globals.append(g[point_cat_batch])  # [N, C_s]
+            multi_scale = torch.cat(point_globals, dim=-1)  # [N, num_stages * C_s]
+
+            # ── 6. Classification head (local + multi-scale global + category) ──
+            head_input = torch.cat([s_out, multi_scale, one_hot], dim=1)
             logits = self.head(head_input)  # [N, num_parts]
 
-            # ── 5. Category masking (MANDATORY) ──
+            # ── 7. Category masking (MANDATORY) ──
             mask = self.cat_mask[point_cat]  # [N, num_parts]
             logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
 
@@ -294,9 +325,11 @@ class SE3PartSegNet(nn.Module):
             if self.use_normals and normals is not None:
                 v_init = self.inject_normals(normals)
 
-            s_out, v_out, _ = self.backbone(
-                pos, ptr, features=features, v_init=v_init
+            backbone_out = self.backbone(
+                pos, ptr, features=features, v_init=v_init,
+                return_encoder_features=True,
             )
+            s_out, v_out, _, enc_s_list, enc_ptr_list = backbone_out
 
             # ── Diagnostics ──
             diag: dict = {}
@@ -306,18 +339,35 @@ class SE3PartSegNet(nn.Module):
             diag['v_norm_mean'] = v_norms.mean().item()
             diag['v_norm_std'] = v_norms.std().item()
 
+            # Per-stage encoder scalar norms (multi-scale health)
+            for i, enc_s in enumerate(enc_s_list):
+                diag[f'enc{i}_s_norm'] = enc_s.norm(dim=-1).mean().item()
+
             # Attention stats from pool layers
             diag.update(self.get_pool_attn_stats())
 
-            # ── Head ──
-            sizes = ptr[1:] - ptr[:-1]
-            point_cat = torch.arange(B, device=device).repeat_interleave(sizes)
-            point_cat = cat_indices[point_cat]
+            # ── Multi-scale Head (same logic as forward) ──
+            global_feats = []
+            for enc_s, enc_ptr in zip(enc_s_list, enc_ptr_list):
+                B_enc = enc_ptr.shape[0] - 1
+                enc_counts = enc_ptr[1:] - enc_ptr[:-1]
+                enc_batch = torch.arange(B_enc, device=device).repeat_interleave(enc_counts)
+                shape_sum = torch.zeros(B_enc, self.hidden_scalar, device=device, dtype=enc_s.dtype)
+                shape_sum.scatter_add_(0, enc_batch.unsqueeze(1).expand_as(enc_s), enc_s)
+                shape_mean = shape_sum / enc_counts.unsqueeze(1).clamp(min=1).to(enc_s.dtype)
+                global_feats.append(shape_mean)
 
-            one_hot = torch.zeros(N, self.num_categories, device=device)
+            sizes = ptr[1:] - ptr[:-1]
+            point_cat_batch = torch.arange(B, device=device).repeat_interleave(sizes)
+            point_cat = cat_indices[point_cat_batch]
+
+            one_hot = torch.zeros(N, self.num_categories, device=device, dtype=s_out.dtype)
             one_hot.scatter_(1, point_cat.unsqueeze(1), 1.0)
 
-            head_input = torch.cat([s_out, one_hot], dim=1)
+            point_globals = [g[point_cat_batch] for g in global_feats]
+            multi_scale = torch.cat(point_globals, dim=-1)
+
+            head_input = torch.cat([s_out, multi_scale, one_hot], dim=1)
             logits = self.head(head_input)
 
             mask = self.cat_mask[point_cat]
