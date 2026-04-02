@@ -158,7 +158,7 @@ def train_one_epoch(
     use_amp: bool = True,
     diag_every: int = 50,
     grad_clip: float = 1.0,
-    amp_max_scale: float = 2**15,
+    amp_max_scale: float = 2**30,  # effectively disabled — model runs FP32
 ) -> Tuple[float, float, dict]:
     """Train for one epoch.
 
