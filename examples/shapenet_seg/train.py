@@ -50,6 +50,17 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast
 from torch.amp import GradScaler
 
+# Reduce CUDA caching allocator fragmentation (must be set before CUDA init).
+# expandable_segments: use virtual memory instead of large contiguous blocks.
+# Typically cuts reserved/allocated ratio from ~2x to ~1.3x.
+import os as _os
+_alloc_conf = _os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '')
+if 'expandable_segments' not in _alloc_conf:
+    _new = 'expandable_segments:True'
+    if _alloc_conf:
+        _new = _alloc_conf + ',' + _new
+    _os.environ['PYTORCH_CUDA_ALLOC_CONF'] = _new
+
 from examples.shapenet_seg.dataset import (
     ShapeNetPartDataset,
     collate_fn,
@@ -356,9 +367,9 @@ def main() -> None:
     use_amp = not args.no_amp and device.type == 'cuda'
     use_normals = not args.no_normals
 
-    # Enable TF32 on Ampere+ GPUs: ~3x faster FP32 matmuls with negligible
-    # precision loss (mantissa 10 bits vs 23). Safe for equivariant TP paths.
     if device.type == 'cuda':
+        # Enable TF32 on Ampere+ GPUs: ~3x faster FP32 matmuls with negligible
+        # precision loss (mantissa 10 bits vs 23). Safe for equivariant TP paths.
         torch.set_float32_matmul_precision('high')
 
     print("=" * 60)
