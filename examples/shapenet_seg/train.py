@@ -344,6 +344,8 @@ def main() -> None:
                         help='Disable bottleneck geometric attention')
     parser.add_argument('--hidden_type2', type=int, default=0,
                         help='Type-2 (l=2) channels. 0=disabled, 4=recommended')
+    parser.add_argument('--compile', action='store_true',
+                        help='Enable torch.compile(dynamic=True) for kernel fusion')
     args = parser.parse_args()
     if args.no_self_tp:
         args.use_self_tp = False
@@ -366,6 +368,7 @@ def main() -> None:
     print(f"Self-TP: {'ON (ν=2)' if args.use_self_tp else 'OFF (ν=1)'}")
     print(f"Bottleneck attn: {'ON' if args.use_bottleneck_attn else 'OFF'}")
     print(f"Type-2 (l=2):  {args.hidden_type2} channels {'(disabled)' if args.hidden_type2 == 0 else ''}")
+    print(f"torch.compile: {'ON (dynamic=True)' if args.compile else 'OFF'}")
     print(f"Batch: {args.batch_size} × {args.accum_steps} accum = "
           f"{args.batch_size * args.accum_steps} effective")
     print()
@@ -420,9 +423,10 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
 
-    # NOTE: torch.compile is DISABLED for _compute_messages.
-    # Variable edge counts (E) cause continuous GPU memory growth.
-    # See: pytorch/pytorch issues #174468, #128424, #119607.
+    # torch.compile: automatic kernel fusion for _compute_messages
+    if args.compile:
+        model = torch.compile(model, dynamic=True)
+        print("  torch.compile(dynamic=True) applied — first batch will be slow (JIT)")
     print()
 
     # ── Optimizer + Scheduler ──

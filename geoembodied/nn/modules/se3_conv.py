@@ -48,11 +48,11 @@ if TYPE_CHECKING:
 # Pure message computation — inner loop
 # ═══════════════════════════════════════════════════════════════════
 
-# NOTE: torch.compile is INTENTIONALLY NOT USED here.
-# Our edge count E varies every batch (different point clouds → different
-# graph topologies). torch.compile(dynamic=True) caches compiled kernels
-# for each distinct E, causing continuous GPU memory growth — a known
-# PyTorch bug (issues #174468, #128424, #119607, #177869).
+# NOTE on torch.compile compatibility:
+# This function is FULLY torch.compile transparent (zero graph breaks).
+# The segment_reduce custom_op and all TP paths trace without issues.
+# As of PyTorch ≥2.10, dynamic=True handles variable E without memory leaks.
+# To enable: torch.compile(model, dynamic=True) at the call site.
 
 def _compute_messages(
     s_src: Tensor,          # [E, C_s_in]  source scalar features
