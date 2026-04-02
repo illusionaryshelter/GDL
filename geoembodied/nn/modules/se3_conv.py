@@ -472,12 +472,12 @@ class SE3Conv(nn.Module):
 
             # ── 1. Gather source features ──
             s_src = scalars_f[graph.row]
-            v_src = vectors_f[graph.row]
+            v_src = vectors_f[graph.row].contiguous()
 
             # Type-2 gather
             t2_src = None
             if type2 is not None and self.in_type2_channels > 0:
-                t2_src = type2.to(compute_dtype)[graph.row]
+                t2_src = type2.to(compute_dtype)[graph.row].contiguous()
 
             # ── 2. Compute radial weights ──
             R = self.radial_basis(graph.dist.to(compute_dtype))
