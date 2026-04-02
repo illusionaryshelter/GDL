@@ -205,13 +205,16 @@ def _compute_messages(
     # Path 7: dir ⊗ f_v → f_t2 via CG(1,1,2)
     # CG is pre-permuted to Cartesian (x,y,z) order at init time,
     # so NO runtime permutation of direction/v_src is needed.
-    # cg_11_2 shape: [3, 3, 5] (Cartesian order)
-    # Direct einsum contracts dir⊗v with CG without materializing [E,Cv,3,3].
+    # cg_11_2 shape: [3, 3, 5] (Cartesian order) → reshaped to [9, 5] for matmul.
     if w_vt2 is not None and cg_11_2 is not None and total_type2_msg is not None:
         r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
-        # Direct CG contraction: dir[E,3] ⊗ v[E,Cv,3] → CG[3,3,5] → [E,Cv,5]
-        # No intermediate [E,Cv,3,3] outer product allocated.
-        tp_result = torch.einsum('ei,ecj,ijk->eck', direction, v_src, cg_11_2)
+        # Outer product: dir[E,3] ⊗ v[E,Cv,3] → [E,Cv,3,3]
+        dir_exp = direction.unsqueeze(1).unsqueeze(-1)   # [E, 1, 3, 1]
+        v_exp = v_src.unsqueeze(-2)                       # [E, Cv, 1, 3]
+        outer = dir_exp * v_exp                           # [E, Cv, 3, 3]
+        # [E, Cv, 3, 3] → [E, Cv, 9] @ CG[9, 5] → [E, Cv, 5]
+        outer_flat = outer.reshape(E, v_src.shape[1], 9)
+        tp_result = outer_flat @ cg_11_2.reshape(9, 5)
         # Channel mixing: [E, 5, C_v_in] @ [C_v_in, C_t2_out] → [E, 5, C_t2_out] → transpose
         mixed = (tp_result.transpose(-1, -2) @ w_vt2.t()).transpose(-1, -2)  # [E, C_t2_out, 5]
         total_type2_msg = total_type2_msg + r_weight.unsqueeze(-1) * mixed

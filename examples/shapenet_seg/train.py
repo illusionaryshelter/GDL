@@ -510,8 +510,9 @@ def main() -> None:
 
         # VRAM tracking
         if device.type == 'cuda':
-            vram_mb = torch.cuda.max_memory_allocated() / 1024**2
-            diag_log += f" | vram={vram_mb:.0f}MB"
+            vram_alloc = torch.cuda.max_memory_allocated() / 1024**2
+            vram_reserved = torch.cuda.max_memory_reserved() / 1024**2
+            diag_log += f" | vram={vram_alloc:.0f}MB(alloc) {vram_reserved:.0f}MB(reserved)"
 
         # Evaluate periodically
         if epoch % args.eval_every == 0 or epoch == args.epochs:
@@ -716,8 +717,9 @@ def _profile_training(
           f"({total_avg * len(loader) / 60000:.1f} min)")
 
     if device.type == 'cuda':
-        peak_mb = torch.cuda.max_memory_allocated() / 1024**2
-        print(f"  Peak VRAM:    {peak_mb:.0f} MB")
+        peak_alloc = torch.cuda.max_memory_allocated() / 1024**2
+        peak_reserved = torch.cuda.max_memory_reserved() / 1024**2
+        print(f"  Peak VRAM:    {peak_alloc:.0f} MB (alloc) / {peak_reserved:.0f} MB (reserved)")
 
     # Identify bottleneck
     bottleneck = max(
