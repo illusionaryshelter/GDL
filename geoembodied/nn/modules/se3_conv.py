@@ -203,23 +203,15 @@ def _compute_messages(
         path_idx += 1
 
     # Path 7: dir ⊗ f_v → f_t2 via CG(1,1,2)
-    # CG uses SH l=1 ordering: (Y_{1,-1}, Y_{1,0}, Y_{1,1}) = (y, z, x)
-    # But direction and v_src are Cartesian (x, y, z).
-    # Must permute both to SH order before outer product.
-    # Perm: Cartesian→SH = [1, 2, 0] (y, z, x)
+    # CG is pre-permuted to Cartesian (x,y,z) order at init time,
+    # so NO runtime permutation of direction/v_src is needed.
+    # cg_11_2 shape: [3, 3, 5] (Cartesian order)
+    # Direct einsum contracts dir⊗v with CG without materializing [E,Cv,3,3].
     if w_vt2 is not None and cg_11_2 is not None and total_type2_msg is not None:
         r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
-        # Permute to SH l=1 ordering: (x,y,z) → (y,z,x)
-        dir_sh = direction[:, [1, 2, 0]]           # [E, 3] in SH order
-        v_sh = v_src[:, :, [1, 2, 0]]              # [E, Cv, 3] in SH order
-        # Outer product: dir_sh[E,3] ⊗ v_sh[E,Cv,3] → [E,Cv,3,3]
-        dir_exp = dir_sh.unsqueeze(1).unsqueeze(-1)  # [E, 1, 3, 1]
-        v_exp = v_sh.unsqueeze(-2)                    # [E, Cv, 1, 3]
-        outer = dir_exp * v_exp                       # [E, Cv, 3, 3]
-        # [E, Cv, 3, 3] → [E, Cv, 9]
-        outer_flat = outer.reshape(E, v_src.shape[1], 9)
-        # CG contraction: [E, Cv, 9] @ [9, 5] → [E, Cv, 5]
-        tp_result = outer_flat @ cg_11_2  # [E, C_v_in, 5]
+        # Direct CG contraction: dir[E,3] ⊗ v[E,Cv,3] → CG[3,3,5] → [E,Cv,5]
+        # No intermediate [E,Cv,3,3] outer product allocated.
+        tp_result = torch.einsum('ei,ecj,ijk->eck', direction, v_src, cg_11_2)
         # Channel mixing: [E, 5, C_v_in] @ [C_v_in, C_t2_out] → [E, 5, C_t2_out] → transpose
         mixed = (tp_result.transpose(-1, -2) @ w_vt2.t()).transpose(-1, -2)  # [E, C_t2_out, 5]
         total_type2_msg = total_type2_msg + r_weight.unsqueeze(-1) * mixed
@@ -394,8 +386,14 @@ class SE3Conv(nn.Module):
         if in_vector_channels > 0 and out_type2_channels > 0:
             self.w_vt2 = nn.Linear(in_vector_channels, out_type2_channels, bias=False)
             self._num_paths += 1
-            # Register CG matrix as buffer (constant, not learnable)
-            self.register_buffer('cg_11_2', get_cg_matrix(1, 1, 2))
+            # Pre-permute CG matrix from SH order (y,z,x) to Cartesian (x,y,z).
+            # This eliminates runtime direction[:,[1,2,0]] index-select copies.
+            # SH→Cartesian permutation: [2, 0, 1]
+            cg_sh = get_cg_matrix(1, 1, 2)  # [9, 5] in SH order
+            cg_3d = cg_sh.reshape(3, 3, 5)
+            P = torch.tensor([2, 0, 1])  # SH→Cartesian
+            cg_cart = cg_3d[P][:, P]  # [3, 3, 5] in Cartesian order
+            self.register_buffer('cg_11_2', cg_cart)  # [3, 3, 5]
         else:
             self.w_vt2 = None
             self.register_buffer('cg_11_2', None)
@@ -503,32 +501,37 @@ class SE3Conv(nn.Module):
                 Ct2_out=self.out_type2_channels,
             )
 
-            # ── 4. Aggregate ──
+            # ── 4. Aggregate (fused into single segment_reduce call) ──
             E = graph.E
-            s_out = segment_reduce(
-                total_scalar_msg,
-                graph.col_sorted, graph.perm,
-                graph.node_start, graph.node_end, N,
-            )
+            Cv3 = self.out_vector_channels * 3
+            v_msg_flat = total_vector_msg.reshape(E, Cv3)
 
-            v_msg_flat = total_vector_msg.reshape(E, -1)
-            v_out_flat = segment_reduce(
-                v_msg_flat,
-                graph.col_sorted, graph.perm,
-                graph.node_start, graph.node_end, N,
-            )
-            v_out = v_out_flat.reshape(N, self.out_vector_channels, 3)
-
-            # Type-2 aggregation
-            t2_out = None
             if total_type2_msg is not None:
-                t2_msg_flat = total_type2_msg.reshape(E, -1)
-                t2_out_flat = segment_reduce(
-                    t2_msg_flat,
+                # Fuse all 3 feature types into one reduce kernel launch
+                Ct5 = self.out_type2_channels * 5
+                t2_msg_flat = total_type2_msg.reshape(E, Ct5)
+                all_msg = torch.cat([total_scalar_msg, v_msg_flat, t2_msg_flat], dim=-1)
+                all_out = segment_reduce(
+                    all_msg,
                     graph.col_sorted, graph.perm,
                     graph.node_start, graph.node_end, N,
                 )
-                t2_out = t2_out_flat.reshape(N, self.out_type2_channels, 5)
+                Cs = self.out_scalar_channels
+                s_out = all_out[:, :Cs]
+                v_out = all_out[:, Cs:Cs+Cv3].reshape(N, self.out_vector_channels, 3)
+                t2_out = all_out[:, Cs+Cv3:].reshape(N, self.out_type2_channels, 5)
+            else:
+                # No type-2: fuse scalar + vector only (2→1 reduce)
+                all_msg = torch.cat([total_scalar_msg, v_msg_flat], dim=-1)
+                all_out = segment_reduce(
+                    all_msg,
+                    graph.col_sorted, graph.perm,
+                    graph.node_start, graph.node_end, N,
+                )
+                Cs = self.out_scalar_channels
+                s_out = all_out[:, :Cs]
+                v_out = all_out[:, Cs:].reshape(N, self.out_vector_channels, 3)
+                t2_out = None
 
             # 5. Scalar bias
             if self.scalar_bias is not None:
