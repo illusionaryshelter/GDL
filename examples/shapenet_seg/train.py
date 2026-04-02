@@ -175,11 +175,10 @@ def train_one_epoch(
     n_batches = 0
 
     # Diagnostic accumulators (sampled every diag_every steps)
-    diag_accum: Dict[str, List[float]] = {
-        'v_norm_mean': [], 'v_norm_std': [],
-        'attn_entropy_mean': [], 'attn_max_mean': [],
-        'attn_uniform_ratio': [],
-    }
+    # Use defaultdict so new keys from forward_with_diagnostics
+    # (e.g. enc0_s_norm, t2_norm_mean) are added automatically.
+    from collections import defaultdict
+    diag_accum: Dict[str, List[float]] = defaultdict(list)
 
     optimizer.zero_grad(set_to_none=True)
 
