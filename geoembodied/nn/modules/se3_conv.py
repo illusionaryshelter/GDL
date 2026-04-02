@@ -52,7 +52,11 @@ if TYPE_CHECKING:
 # This function is FULLY torch.compile transparent (zero graph breaks).
 # The segment_reduce custom_op and all TP paths trace without issues.
 # As of PyTorch ≥2.10, dynamic=True handles variable E without memory leaks.
-# To enable: torch.compile(model, dynamic=True) at the call site.
+#
+# IMPORTANT: Compile THIS FUNCTION directly, NOT the whole model.
+# The outer model (graph construction, KNN, .item(), checkpoint) contains
+# untraceable ops that crash or produce graph breaks.
+# Usage:  _compute_messages = torch.compile(_compute_messages, dynamic=True)
 
 def _compute_messages(
     s_src: Tensor,          # [E, C_s_in]  source scalar features

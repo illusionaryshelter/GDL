@@ -356,6 +356,11 @@ def main() -> None:
     use_amp = not args.no_amp and device.type == 'cuda'
     use_normals = not args.no_normals
 
+    # Enable TF32 on Ampere+ GPUs: ~3x faster FP32 matmuls with negligible
+    # precision loss (mantissa 10 bits vs 23). Safe for equivariant TP paths.
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
+
     print("=" * 60)
     print("SE(3)-Equivariant ShapeNet Part Segmentation")
     print("=" * 60)
@@ -424,9 +429,17 @@ def main() -> None:
     print(f"Parameters: {n_params:,}")
 
     # torch.compile: automatic kernel fusion for _compute_messages
+    # NOTE: We compile ONLY the inner TP function, NOT the whole model.
+    # The outer model contains untraceable ops (CUDA KNN, radius_graph,
+    # .item() in adaptive radius, checkpoint with free variables) that
+    # cause graph breaks or crashes. _compute_messages is verified
+    # zero-graph-break and contains the actual TP compute hotpath.
     if args.compile:
-        model = torch.compile(model, dynamic=True)
-        print("  torch.compile(dynamic=True) applied — first batch will be slow (JIT)")
+        import geoembodied.nn.modules.se3_conv as _se3_conv_mod
+        _se3_conv_mod._compute_messages = torch.compile(
+            _se3_conv_mod._compute_messages, dynamic=True,
+        )
+        print("  torch.compile(dynamic=True) applied to _compute_messages")
     print()
 
     # ── Optimizer + Scheduler ──
