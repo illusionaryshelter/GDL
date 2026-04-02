@@ -31,6 +31,18 @@ from typing import Optional
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.amp import autocast
+
+
+def _amp_safe_cast(x: Tensor) -> Tensor:
+    """Upcast FP16/BF16 → FP32 for AMP safety, but PRESERVE FP64.
+
+    `.float()` unconditionally casts to FP32, destroying FP64 precision
+    needed for equivariance tests.  This helper only upcasts half dtypes.
+    """
+    if x.dtype in (torch.float16, torch.bfloat16):
+        return x.float()
+    return x  # FP32 or FP64 — keep as-is
 
 from geoembodied.nn.modules.multi_scale_se3_net import MultiScaleSE3Net
 
@@ -190,32 +202,59 @@ class SE3PartSegNet(nn.Module):
         B = ptr.shape[0] - 1
         device = pos.device
 
-        # ── 1. Project normals → initial vector features ──
-        v_init = None
-        if self.use_normals and normals is not None:
-            v_init = self.inject_normals(normals)  # [N, C_v, 3]
+        # ── AMP GUARD ──────────────────────────────────────────────
+        # Disable autocast for the ENTIRE model forward pass.
+        #
+        # Why: CUDA autocast silently demotes ALL nn.Linear and
+        # matmul (@) operations to FP16 — including geometric layers
+        # (RadialBasis MLP, gate projections, skip projections,
+        # normal embedding, classification head).  In the backward
+        # pass, these FP16 matmul gradients × GradScaler scale
+        # overflow FP16 max (65504) → Inf → GradScaler halves
+        # scale every epoch, eventually reaching scale=1 and
+        # causing gradient underflow + training collapse.
+        #
+        # This model's computation is >95% FP32 by design (SE3Conv
+        # requires FP32 for geometric tensor products).  The few
+        # nn.Linear layers that autocast would "optimize" to FP16
+        # are too small to matter for throughput.  Disabling
+        # autocast here ensures stable training with zero perf cost.
+        # ──────────────────────────────────────────────────────────
+        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+        with autocast(device_type, enabled=False):
+            # Upcast half → FP32; preserve FP64 for equivariance tests
+            pos = _amp_safe_cast(pos)
+            if normals is not None:
+                normals = _amp_safe_cast(normals)
+            if features is not None:
+                features = _amp_safe_cast(features)
 
-        # ── 2. Run U-Net backbone ──
-        s_out, v_out, _ = self.backbone(
-            pos, ptr, features=features, v_init=v_init
-        )
-        # s_out: [N, C_s], v_out: [N, C_v, 3]
+            # ── 1. Project normals → initial vector features ──
+            v_init = None
+            if self.use_normals and normals is not None:
+                v_init = self.inject_normals(normals)  # [N, C_v, 3]
 
-        # ── 3. Build per-point category one-hot ──
-        sizes = ptr[1:] - ptr[:-1]  # [B]
-        point_cat = torch.arange(B, device=device).repeat_interleave(sizes)
-        point_cat = cat_indices[point_cat]  # [N] category indices
+            # ── 2. Run U-Net backbone ──
+            s_out, v_out, _ = self.backbone(
+                pos, ptr, features=features, v_init=v_init
+            )
+            # s_out: [N, C_s], v_out: [N, C_v, 3]
 
-        one_hot = torch.zeros(N, self.num_categories, device=device)
-        one_hot.scatter_(1, point_cat.unsqueeze(1), 1.0)
+            # ── 3. Build per-point category one-hot ──
+            sizes = ptr[1:] - ptr[:-1]  # [B]
+            point_cat = torch.arange(B, device=device).repeat_interleave(sizes)
+            point_cat = cat_indices[point_cat]  # [N] category indices
 
-        # ── 4. Classification head (scalars + category only) ──
-        head_input = torch.cat([s_out, one_hot], dim=1)
-        logits = self.head(head_input)  # [N, num_parts]
+            one_hot = torch.zeros(N, self.num_categories, device=device)
+            one_hot.scatter_(1, point_cat.unsqueeze(1), 1.0)
 
-        # ── 5. Category masking (MANDATORY) ──
-        mask = self.cat_mask[point_cat]  # [N, num_parts]
-        logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+            # ── 4. Classification head (scalars + category only) ──
+            head_input = torch.cat([s_out, one_hot], dim=1)
+            logits = self.head(head_input)  # [N, num_parts]
+
+            # ── 5. Category masking (MANDATORY) ──
+            mask = self.cat_mask[point_cat]  # [N, num_parts]
+            logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
 
         return logits
 
@@ -242,38 +281,47 @@ class SE3PartSegNet(nn.Module):
         B = ptr.shape[0] - 1
         device = pos.device
 
-        v_init = None
-        if self.use_normals and normals is not None:
-            v_init = self.inject_normals(normals)
+        # AMP guard: same as forward() — see docstring there.
+        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+        with autocast(device_type, enabled=False):
+            pos = _amp_safe_cast(pos)
+            if normals is not None:
+                normals = _amp_safe_cast(normals)
+            if features is not None:
+                features = _amp_safe_cast(features)
 
-        s_out, v_out, _ = self.backbone(
-            pos, ptr, features=features, v_init=v_init
-        )
+            v_init = None
+            if self.use_normals and normals is not None:
+                v_init = self.inject_normals(normals)
 
-        # ── Diagnostics ──
-        diag: dict = {}
+            s_out, v_out, _ = self.backbone(
+                pos, ptr, features=features, v_init=v_init
+            )
 
-        # Vector norm health
-        v_norms = v_out.norm(dim=-1).mean(dim=-1)  # [N]
-        diag['v_norm_mean'] = v_norms.mean().item()
-        diag['v_norm_std'] = v_norms.std().item()
+            # ── Diagnostics ──
+            diag: dict = {}
 
-        # Attention stats from pool layers
-        diag.update(self.get_pool_attn_stats())
+            # Vector norm health
+            v_norms = v_out.norm(dim=-1).mean(dim=-1)  # [N]
+            diag['v_norm_mean'] = v_norms.mean().item()
+            diag['v_norm_std'] = v_norms.std().item()
 
-        # ── Head ──
-        sizes = ptr[1:] - ptr[:-1]
-        point_cat = torch.arange(B, device=device).repeat_interleave(sizes)
-        point_cat = cat_indices[point_cat]
+            # Attention stats from pool layers
+            diag.update(self.get_pool_attn_stats())
 
-        one_hot = torch.zeros(N, self.num_categories, device=device)
-        one_hot.scatter_(1, point_cat.unsqueeze(1), 1.0)
+            # ── Head ──
+            sizes = ptr[1:] - ptr[:-1]
+            point_cat = torch.arange(B, device=device).repeat_interleave(sizes)
+            point_cat = cat_indices[point_cat]
 
-        head_input = torch.cat([s_out, one_hot], dim=1)
-        logits = self.head(head_input)
+            one_hot = torch.zeros(N, self.num_categories, device=device)
+            one_hot.scatter_(1, point_cat.unsqueeze(1), 1.0)
 
-        mask = self.cat_mask[point_cat]
-        logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+            head_input = torch.cat([s_out, one_hot], dim=1)
+            logits = self.head(head_input)
+
+            mask = self.cat_mask[point_cat]
+            logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
 
         return logits, diag
 

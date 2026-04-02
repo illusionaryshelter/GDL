@@ -30,6 +30,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch.amp import autocast
 from typing import Tuple
 
 # FPS dispatch now goes through geoembodied.csrc (CUDA kernel or fallback)
@@ -125,160 +126,161 @@ class EquivariantPool(nn.Module):
             fps_idx: FPS selected indices (global, into original)
                 shape: [N_out], int64
         """
-        # Force FP32 for geometric computations (norm, sqrt, cosine).
+        # Force ≥FP32 for geometric computations (norm, sqrt, cosine).
         # Under AMP, inputs may be FP16 but these ops need full precision.
+        # CRITICAL: must also disable autocast, otherwise attn_mlp's
+        # nn.Linear layers get silently demoted to FP16 by autocast,
+        # causing backward gradient overflow → GradScaler instability.
+        # NOTE: preserve FP64 if present (equivariance tests need it).
         input_dtype = scalars.dtype
-        pos = pos.float()
-        scalars = scalars.float()
-        vectors = vectors.float()
-
-        B = ptr.shape[0] - 1
         device = pos.device
+        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+        compute_dtype = torch.float32 if input_dtype in (torch.float16, torch.bfloat16) else input_dtype
 
-        # ── 1. FPS: select seed points per batch ──
-        # Compute per-batch sample count entirely on GPU (no CPU sync)
-        sizes = ptr[1:] - ptr[:-1]  # [B], on device
-        k_per_batch = (sizes.float() * self.ratio).clamp(min=1).long()  # [B]
+        with autocast(device_type, enabled=False):
+            pos = pos.to(compute_dtype)
+            scalars = scalars.to(compute_dtype)
+            vectors = vectors.to(compute_dtype)
 
-        # Batched FPS: CUDA kernel (zero sync in loop) or PyTorch fallback
-        from geoembodied.csrc import fps_available, fps_cuda, _fps_iterative_fallback
-        if fps_available() and pos.is_cuda:
-            fps_idx = fps_cuda(pos, ptr, k_per_batch)
-        else:
-            fps_idx = _fps_iterative_fallback(pos, ptr, k_per_batch)
+            B = ptr.shape[0] - 1
 
-        seed_pos = pos[fps_idx]  # [N_out, 3]
+            # ── 1. FPS: select seed points per batch ──
+            # Compute per-batch sample count entirely on GPU (no CPU sync)
+            sizes = ptr[1:] - ptr[:-1]  # [B], on device
+            k_per_batch = (sizes.float() * self.ratio).clamp(min=1).long()  # [B]
 
-        # Build ptr_out for downsampled batch (stays on GPU)
-        sizes_out = k_per_batch  # [B]
-        ptr_out = torch.zeros(B + 1, dtype=torch.int64, device=device)
-        ptr_out[1:] = sizes_out.cumsum(0)
+            # Batched FPS: CUDA kernel (zero sync in loop) or PyTorch fallback
+            from geoembodied.csrc import fps_available, fps_cuda, _fps_iterative_fallback
+            if fps_available() and pos.is_cuda:
+                fps_idx = fps_cuda(pos, ptr, k_per_batch)
+            else:
+                fps_idx = _fps_iterative_fallback(pos, ptr, k_per_batch)
 
-        N_out = fps_idx.shape[0]
+            seed_pos = pos[fps_idx]  # [N_out, 3]
 
-        # ── 2. KNN: find neighbors of each seed in original cloud ──
-        knn_idx, knn_dists = knn(
-            seed_pos, pos, ptr_out, ptr, self.k_neighbors
-        )  # [N_out, K], [N_out, K]
+            # Build ptr_out for downsampled batch (stays on GPU)
+            sizes_out = k_per_batch  # [B]
+            ptr_out = torch.zeros(B + 1, dtype=torch.int64, device=device)
+            ptr_out[1:] = sizes_out.cumsum(0)
 
-        # ── 3. Compute attention weights from SO(3)-INVARIANT features ──
-        # Using cosine similarities (not raw dot products) to decouple
-        # angle information from magnitude. Combined with per-feature
-        # BatchNorm1d and learnable temperature for well-conditioned
-        # attention learning.
+            N_out = fps_idx.shape[0]
 
-        valid_mask = knn_idx >= 0  # [N_out, K]
-        safe_idx = knn_idx.clamp(min=0)  # safe indexing for gather
-        K = self.k_neighbors
-        eps = 1e-8
+            # ── 2. KNN: find neighbors of each seed in original cloud ──
+            knn_idx, knn_dists = knn(
+                seed_pos, pos, ptr_out, ptr, self.k_neighbors
+            )  # [N_out, K], [N_out, K]
 
-        # ── Scalar features ──
-        nbr_scalars = scalars[safe_idx]                         # [N_out, K, C_s]
-        seed_scalars = scalars[fps_idx]                         # [N_out, C_s]
+            # ── 3. Compute attention weights from SO(3)-INVARIANT features ──
+            valid_mask = knn_idx >= 0  # [N_out, K]
+            safe_idx = knn_idx.clamp(min=0)  # safe indexing for gather
+            K = self.k_neighbors
+            eps = 1e-8
 
-        nbr_s_norm = nbr_scalars.norm(dim=-1)                  # [N_out, K]
-        seed_s_norm = seed_scalars.norm(dim=-1, keepdim=True)   # [N_out, 1]
+            # ── Scalar features ──
+            nbr_scalars = scalars[safe_idx]                         # [N_out, K, C_s]
+            seed_scalars = scalars[fps_idx]                         # [N_out, C_s]
 
-        # Feature 0: distance
-        dist = knn_dists.clamp(min=eps).sqrt()                  # [N_out, K]
+            nbr_s_norm = nbr_scalars.norm(dim=-1)                  # [N_out, K]
+            seed_s_norm = seed_scalars.norm(dim=-1, keepdim=True)   # [N_out, 1]
 
-        # Feature 1: scalar norm ratio (relative, ~1.0, invariant)
-        scalar_ratio = nbr_s_norm / seed_s_norm.clamp(min=eps)  # [N_out, K]
+            # Feature 0: distance
+            dist = knn_dists.clamp(min=eps).sqrt()                  # [N_out, K]
 
-        # ── Vector features ──
-        nbr_vectors = vectors[safe_idx]                         # [N_out, K, C_v, 3]
-        seed_vectors = vectors[fps_idx]                         # [N_out, C_v, 3]
-        seed_vectors_exp = seed_vectors.unsqueeze(1)            # [N_out, 1, C_v, 3]
+            # Feature 1: scalar norm ratio (relative, ~1.0, invariant)
+            scalar_ratio = nbr_s_norm / seed_s_norm.clamp(min=eps)  # [N_out, K]
 
-        # Per-channel norms for cosine similarity
-        nbr_v_norms = nbr_vectors.norm(dim=-1)                 # [N_out, K, C_v]
-        seed_v_norms = seed_vectors.norm(dim=-1)                # [N_out, C_v]
+            # ── Vector features ──
+            nbr_vectors = vectors[safe_idx]                         # [N_out, K, C_v, 3]
+            seed_vectors = vectors[fps_idx]                         # [N_out, C_v, 3]
+            seed_vectors_exp = seed_vectors.unsqueeze(1)            # [N_out, 1, C_v, 3]
 
-        # Feature 2: cos(v_seed, v_nbr) — angular alignment, [-1, 1]
-        vi_vj_dot = (seed_vectors_exp * nbr_vectors).sum(dim=-1)  # [N_out, K, C_v]
-        cos_vi_vj = vi_vj_dot / (
-            seed_v_norms.unsqueeze(1) * nbr_v_norms + eps
-        )                                                       # [N_out, K, C_v]
-        cos_vi_vj_mean = cos_vi_vj.mean(dim=-1)                # [N_out, K]
+            # Per-channel norms for cosine similarity
+            nbr_v_norms = nbr_vectors.norm(dim=-1)                 # [N_out, K, C_v]
+            seed_v_norms = seed_vectors.norm(dim=-1)                # [N_out, C_v]
 
-        # Feature 3 & 4: direction-vector cosine similarities
-        rel_pos = pos[safe_idx] - seed_pos.unsqueeze(1)         # [N_out, K, 3]
-        rel_dist = rel_pos.norm(dim=-1, keepdim=True).clamp(min=eps)
-        d_hat = rel_pos / rel_dist                              # [N_out, K, 3] unit
+            # Feature 2: cos(v_seed, v_nbr) — angular alignment, [-1, 1]
+            vi_vj_dot = (seed_vectors_exp * nbr_vectors).sum(dim=-1)  # [N_out, K, C_v]
+            cos_vi_vj = vi_vj_dot / (
+                seed_v_norms.unsqueeze(1) * nbr_v_norms + eps
+            )                                                       # [N_out, K, C_v]
+            cos_vi_vj_mean = cos_vi_vj.mean(dim=-1)                # [N_out, K]
 
-        # cos(d̂_ij, v_nbr): [N_out, K, 1, 3] · [N_out, K, C_v, 3] → mean over C_v
-        d_vj_dot = (d_hat.unsqueeze(2) * nbr_vectors).sum(dim=-1)  # [N_out, K, C_v]
-        cos_d_vj = d_vj_dot / (nbr_v_norms + eps)              # [N_out, K, C_v]
-        cos_d_vj_mean = cos_d_vj.mean(dim=-1)                  # [N_out, K]
+            # Feature 3 & 4: direction-vector cosine similarities
+            rel_pos = pos[safe_idx] - seed_pos.unsqueeze(1)         # [N_out, K, 3]
+            rel_dist = rel_pos.norm(dim=-1, keepdim=True).clamp(min=eps)
+            d_hat = rel_pos / rel_dist                              # [N_out, K, 3] unit
 
-        # cos(d̂_ij, v_seed): angular alignment of direction with seed
-        d_vi_dot = (d_hat.unsqueeze(2) * seed_vectors_exp).sum(dim=-1)  # [N_out, K, C_v]
-        cos_d_vi = d_vi_dot / (seed_v_norms.unsqueeze(1) + eps)  # [N_out, K, C_v]
-        cos_d_vi_mean = cos_d_vi.mean(dim=-1)                  # [N_out, K]
+            # cos(d̂_ij, v_nbr)
+            d_vj_dot = (d_hat.unsqueeze(2) * nbr_vectors).sum(dim=-1)  # [N_out, K, C_v]
+            cos_d_vj = d_vj_dot / (nbr_v_norms + eps)              # [N_out, K, C_v]
+            cos_d_vj_mean = cos_d_vj.mean(dim=-1)                  # [N_out, K]
 
-        # Feature 5 & 6: vector magnitudes
-        nbr_v_norm_mean = nbr_v_norms.mean(dim=-1)             # [N_out, K]
-        seed_v_norm_mean = seed_v_norms.mean(dim=-1, keepdim=True).expand(-1, K)
+            # cos(d̂_ij, v_seed)
+            d_vi_dot = (d_hat.unsqueeze(2) * seed_vectors_exp).sum(dim=-1)  # [N_out, K, C_v]
+            cos_d_vi = d_vi_dot / (seed_v_norms.unsqueeze(1) + eps)  # [N_out, K, C_v]
+            cos_d_vi_mean = cos_d_vi.mean(dim=-1)                  # [N_out, K]
 
-        # Stack 7 well-conditioned invariant features: [N_out, K, 7]
-        attn_input = torch.stack([
-            dist,              # ≥0, physical scale
-            scalar_ratio,      # ~1.0, relative
-            cos_vi_vj_mean,    # [-1, 1], angular
-            cos_d_vj_mean,     # [-1, 1], angular
-            cos_d_vi_mean,     # [-1, 1], angular
-            nbr_v_norm_mean,   # ≥0, magnitude
-            seed_v_norm_mean,  # ≥0, magnitude
-        ], dim=-1)
+            # Feature 5 & 6: vector magnitudes
+            nbr_v_norm_mean = nbr_v_norms.mean(dim=-1)             # [N_out, K]
+            seed_v_norm_mean = seed_v_norms.mean(dim=-1, keepdim=True).expand(-1, K)
 
-        # Per-feature BatchNorm: normalize each of the 7 features to ~N(0,1)
-        # Reshape [N_out, K, 7] → [N_out*K, 7] for BatchNorm1d → reshape back
-        NK = N_out * K
-        attn_flat = attn_input.reshape(NK, -1)       # [NK, 7]
-        attn_normed = self.attn_feat_norm(attn_flat)  # [NK, 7]
-        attn_normed = attn_normed.reshape(N_out, K, -1)  # [N_out, K, 7]
+            # Stack 7 well-conditioned invariant features: [N_out, K, 7]
+            attn_input = torch.stack([
+                dist,              # ≥0, physical scale
+                scalar_ratio,      # ~1.0, relative
+                cos_vi_vj_mean,    # [-1, 1], angular
+                cos_d_vj_mean,     # [-1, 1], angular
+                cos_d_vi_mean,     # [-1, 1], angular
+                nbr_v_norm_mean,   # ≥0, magnitude
+                seed_v_norm_mean,  # ≥0, magnitude
+            ], dim=-1)
 
-        # MLP: [N_out, K, 7] → [N_out, K, 1] → [N_out, K]
-        attn_logits = self.attn_mlp(attn_normed).squeeze(-1)
+            # Per-feature BatchNorm: [N_out, K, 7] → [N_out*K, 7] → normalize → reshape
+            NK = N_out * K
+            attn_flat = attn_input.reshape(NK, -1)       # [NK, 7]
+            attn_normed = self.attn_feat_norm(attn_flat)  # [NK, 7]
+            attn_normed = attn_normed.reshape(N_out, K, -1)  # [N_out, K, 7]
 
-        # Learnable temperature: sharpen or smooth attention
-        # temp = exp(log_temp), logits = logits / temp
-        temperature = self.log_temperature.exp().clamp(min=0.01)
-        attn_logits = attn_logits / temperature
+            # MLP: [N_out, K, 7] → [N_out, K, 1] → [N_out, K]
+            attn_logits = self.attn_mlp(attn_normed).squeeze(-1)
 
-        # Mask invalid neighbors (padding) to -inf
-        attn_logits = attn_logits.masked_fill(~valid_mask, float('-inf'))
+            # Learnable temperature
+            temperature = self.log_temperature.exp().clamp(min=0.01)
+            attn_logits = attn_logits / temperature
 
-        # Softmax over neighbors
-        attn_weights = torch.softmax(attn_logits, dim=-1)  # [N_out, K]
+            # Mask invalid neighbors (padding) to -inf
+            attn_logits = attn_logits.masked_fill(~valid_mask, float('-inf'))
 
-        # Handle all-invalid rows (single isolated points)
-        nan_mask = attn_weights.isnan()
-        if nan_mask.any():
-            attn_weights = attn_weights.masked_fill(nan_mask, 0.0)
+            # Softmax over neighbors
+            attn_weights = torch.softmax(attn_logits, dim=-1)  # [N_out, K]
 
-        # Store for diagnostic extraction.
-        # MUST use .clone() — .detach() alone shares storage with the
-        # computation graph tensor, preventing the autograd graph from
-        # being freed on backward(). .clone() creates independent storage.
-        self._last_attn_weights = attn_weights.detach().clone()  # [N_out, K]
-        self._last_valid_mask = valid_mask.detach().clone()       # [N_out, K]
+            # Handle all-invalid rows (single isolated points)
+            nan_mask = attn_weights.isnan()
+            if nan_mask.any():
+                attn_weights = attn_weights.masked_fill(nan_mask, 0.0)
 
-        # ── 4. Weighted aggregation ──
-        w = attn_weights  # [N_out, K]
+            # Store for diagnostic extraction.
+            # MUST use .clone() — .detach() alone shares storage with the
+            # computation graph tensor, preventing the autograd graph from
+            # being freed on backward(). .clone() creates independent storage.
+            self._last_attn_weights = attn_weights.detach().clone()  # [N_out, K]
+            self._last_valid_mask = valid_mask.detach().clone()       # [N_out, K]
 
-        # Scalar aggregation: [N_out, K, C_s] weighted sum → [N_out, C_s]
-        s_out = (w.unsqueeze(-1) * nbr_scalars).sum(dim=1)
+            # ── 4. Weighted aggregation ──
+            w = attn_weights  # [N_out, K]
 
-        # Vector aggregation: [N_out, K, C_v, 3] weighted sum → [N_out, C_v, 3]
-        nbr_vectors = vectors[safe_idx]  # [N_out, K, C_v, 3]
-        v_out = (w.unsqueeze(-1).unsqueeze(-1) * nbr_vectors).sum(dim=1)
+            # Scalar aggregation: [N_out, K, C_s] weighted sum → [N_out, C_s]
+            s_out = (w.unsqueeze(-1) * nbr_scalars).sum(dim=1)
 
-        # Zero out features from invalid neighbors
-        all_invalid = ~valid_mask.any(dim=1)  # [N_out]
-        if all_invalid.any():
-            s_out[all_invalid] = 0.0
-            v_out[all_invalid] = 0.0
+            # Vector aggregation: [N_out, K, C_v, 3] weighted sum → [N_out, C_v, 3]
+            nbr_vectors = vectors[safe_idx]  # [N_out, K, C_v, 3]
+            v_out = (w.unsqueeze(-1).unsqueeze(-1) * nbr_vectors).sum(dim=1)
+
+            # Zero out features from invalid neighbors
+            all_invalid = ~valid_mask.any(dim=1)  # [N_out]
+            if all_invalid.any():
+                s_out[all_invalid] = 0.0
+                v_out[all_invalid] = 0.0
 
         return seed_pos, s_out.to(input_dtype), v_out.to(input_dtype), ptr_out, fps_idx
 

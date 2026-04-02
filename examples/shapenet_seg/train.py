@@ -420,12 +420,12 @@ def main() -> None:
         optimizer, T_max=args.epochs, eta_min=1e-5
     )
 
-    # AMP GradScaler: start at the model's natural scale (2^9=512).
-    # SE3Conv computes in FP32 internally but backward uses FP16,
-    # producing gradients ~0.1-4.0. At scale=512, max safe FP16
-    # gradient = 65504/512 ≈ 128, leaving ample headroom.
-    # Cap at 2^15 prevents unbounded growth (see train_one_epoch).
-    scaler = GradScaler('cuda', enabled=use_amp, init_scale=2**9)
+    # AMP GradScaler: The SE3PartSegNet model disables autocast
+    # internally (all geometric ops + nn.Linear run in FP32), so the
+    # scaler effectively becomes a no-op.  We keep it for API
+    # compatibility with the autocast() wrapper in train_one_epoch.
+    # init_scale can be high since FP32 gradients never overflow.
+    scaler = GradScaler('cuda', enabled=use_amp, init_scale=2**16)
 
     # ── Profiling mode ──
     if args.profile:

@@ -389,6 +389,7 @@ class SE3Conv(nn.Module):
         """
         N = graph.N
         device = scalars.device
+        input_dtype = scalars.dtype
 
         if graph.E == 0:
             # Keep autograd graph alive: inputs contribute zero, but grad flows
@@ -401,56 +402,80 @@ class SE3Conv(nn.Module):
                 s_out = s_out + self.scalar_bias
             return s_out, v_out
 
-        # ── 1. Gather source features (dynamic: depends on graph topology) ──
-        s_src = scalars[graph.row]       # [E, C_s_in]
-        v_src = vectors[graph.row]       # [E, C_v_in, 3]
+        # ── AMP GUARD ──────────────────────────────────────────────
+        # Disable autocast for the ENTIRE convolution body.
+        #
+        # Why: autocast silently demotes nn.Linear and @ (matmul) to
+        # FP16, including RadialBasis.mlp and the tensor-product
+        # matmuls in _compute_messages (s_src @ w_ss.t() etc.).
+        # In the backward pass these FP16 matmul gradients, when
+        # multiplied by GradScaler's scale factor, overflow FP16 max
+        # (65504) → Inf → GradScaler halves scale every epoch,
+        # eventually reaching scale=1 and causing gradient underflow.
+        #
+        # By disabling autocast here, ALL operations (radial MLP,
+        # tensor products, segment reduce) run in genuine FP32,
+        # both forward AND backward.  This is correct: geometric
+        # tensor products require FP32 precision (Rule 4).
+        # ──────────────────────────────────────────────────────────
+        device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+        with autocast(device_type, enabled=False):
+            # Upcast half → FP32; preserve FP64 for equivariance tests
+            compute_dtype = torch.float32 if scalars.dtype in (torch.float16, torch.bfloat16) else scalars.dtype
+            scalars_f = scalars.to(compute_dtype)
+            vectors_f = vectors.to(compute_dtype)
 
-        # ── 2. Compute radial weights ──
-        R = self.radial_basis(graph.dist)  # [E, P]
+            # ── 1. Gather source features ──
+            s_src = scalars_f[graph.row]       # [E, C_s_in]
+            v_src = vectors_f[graph.row]       # [E, C_v_in, 3]
 
-        # ── 3. Compute messages (pure function, compile-friendly) ──
-        total_scalar_msg, total_vector_msg = _compute_messages(
-            s_src, v_src,
-            graph.direction, graph.Y[..., 0:1], R,
-            self.w_ss.weight if self.w_ss is not None else None,
-            self.w_sv.weight if self.w_sv is not None else None,
-            self.w_vv_scalar.weight if self.w_vv_scalar is not None else None,
-            self.w_vs.weight if self.w_vs is not None else None,
-            self.w_vv_cross.weight if self.w_vv_cross is not None else None,
-            self.out_scalar_channels,
-            self.out_vector_channels,
-        )
+            # ── 2. Compute radial weights (MLP runs in ≥FP32) ──
+            R = self.radial_basis(graph.dist.to(compute_dtype))  # [E, P]
 
-        # ── 4. Aggregate: deterministic segment reduce (custom CUDA op) ──
-        E = graph.E
-        s_out = segment_reduce(
-            total_scalar_msg,
-            graph.col_sorted, graph.perm,
-            graph.node_start, graph.node_end,
-            N,
-        )
+            # ── 3. Compute messages (all matmuls in genuine FP32) ──
+            total_scalar_msg, total_vector_msg = _compute_messages(
+                s_src, v_src,
+                graph.direction.to(compute_dtype), graph.Y[..., 0:1].to(compute_dtype), R,
+                self.w_ss.weight if self.w_ss is not None else None,
+                self.w_sv.weight if self.w_sv is not None else None,
+                self.w_vv_scalar.weight if self.w_vv_scalar is not None else None,
+                self.w_vs.weight if self.w_vs is not None else None,
+                self.w_vv_cross.weight if self.w_vv_cross is not None else None,
+                self.out_scalar_channels,
+                self.out_vector_channels,
+            )
 
-        # For vectors: reshape [E, Cv, 3] → [E, Cv*3], reduce, reshape back
-        v_msg_flat = total_vector_msg.reshape(E, -1)  # [E, Cv*3]
-        v_out_flat = segment_reduce(
-            v_msg_flat,
-            graph.col_sorted, graph.perm,
-            graph.node_start, graph.node_end,
-            N,
-        )
-        v_out = v_out_flat.reshape(N, self.out_vector_channels, 3)
+            # ── 4. Aggregate: deterministic segment reduce ──
+            E = graph.E
+            s_out = segment_reduce(
+                total_scalar_msg,
+                graph.col_sorted, graph.perm,
+                graph.node_start, graph.node_end,
+                N,
+            )
 
-        # 5. Add scalar bias
-        if self.scalar_bias is not None:
-            s_out = s_out + self.scalar_bias
+            # Vectors: [E, Cv, 3] → [E, Cv*3], reduce, reshape back
+            v_msg_flat = total_vector_msg.reshape(E, -1)  # [E, Cv*3]
+            v_out_flat = segment_reduce(
+                v_msg_flat,
+                graph.col_sorted, graph.perm,
+                graph.node_start, graph.node_end,
+                N,
+            )
+            v_out = v_out_flat.reshape(N, self.out_vector_channels, 3)
 
-        # 6. Zero out pad point features (algebraic mask enforcement)
-        if mask is not None:
-            pad_mask = (~mask).unsqueeze(-1)  # [N, 1]
-            s_out = s_out.masked_fill(pad_mask, 0.0)
-            v_out = v_out.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+            # 5. Add scalar bias
+            if self.scalar_bias is not None:
+                s_out = s_out + self.scalar_bias
 
-        return s_out, v_out
+            # 6. Zero out pad point features (algebraic mask enforcement)
+            if mask is not None:
+                pad_mask = (~mask).unsqueeze(-1)  # [N, 1]
+                s_out = s_out.masked_fill(pad_mask, 0.0)
+                v_out = v_out.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+
+        # Cast output back to input dtype for downstream autocast layers
+        return s_out.to(input_dtype), v_out.to(input_dtype)
 
     def forward_legacy(
         self,
