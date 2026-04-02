@@ -66,6 +66,7 @@ class _EncoderStage(nn.Module):
         self,
         channels_scalar: int,
         channels_vector: int,
+        channels_type2: int = 0,
         num_layers: int = 2,
         radius_multiplier: float = 4.0,
         max_num_neighbors: int = 32,
@@ -76,6 +77,7 @@ class _EncoderStage(nn.Module):
         super().__init__()
         self.channels_scalar = channels_scalar
         self.channels_vector = channels_vector
+        self.channels_type2 = channels_type2
         self.radius_multiplier = radius_multiplier
         self.max_num_neighbors = max_num_neighbors
         self.knn_fallback_k = knn_fallback_k
@@ -84,6 +86,7 @@ class _EncoderStage(nn.Module):
             SE3NetBlock(
                 channels_scalar=channels_scalar,
                 channels_vector=channels_vector,
+                channels_type2=channels_type2,
                 radius=1.0,  # placeholder, will use adaptive
                 max_num_neighbors=max_num_neighbors,
                 gate_mode=gate_mode,
@@ -220,7 +223,8 @@ class _EncoderStage(nn.Module):
         ptr: Tensor,
         batch: Optional[Tensor] = None,
         graph: Optional[SpatialGraph] = None,
-    ) -> Tuple[Tensor, Tensor, SpatialGraph]:
+        type2: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, ...]:
         """Run SE3Conv blocks at this scale.
 
         Args:
@@ -229,45 +233,44 @@ class _EncoderStage(nn.Module):
             pos: [N, 3]
             ptr: [B+1]
             batch: [N] optional
-            graph: Pre-built SpatialGraph to reuse (e.g. from encoder
-                   skip connection). If None, builds a new graph.
-                   SAFETY: Only reuse when pos is the SAME tensor
-                   (same positions → same topology + edge vectors).
+            graph: Pre-built SpatialGraph to reuse
+            type2: [N, C_t2, 5] optional type-2 tensor features
 
         Returns:
-            (s_out, v_out, graph) — graph is returned for potential reuse
+            Without type-2: (s_out, v_out, graph)
+            With type-2: (s_out, v_out, t2_out, graph)
         """
         if graph is None:
-            # Graph construction does NOT need gradients:
-            # edge_vec, SH, CSR all derive from pos (fixed input, not learnable).
-            # Disabling autograd here avoids tracking ops on ~E×3 direction
-            # tensors and ~E×9 SH tensors, saving GPU memory and kernel overhead.
             with torch.no_grad():
                 radius = self._estimate_adaptive_radius(pos, ptr)
                 graph = self._build_hybrid_graph(pos, radius, ptr=ptr, batch=batch)
 
-        # Run blocks with gradient checkpointing during training.
-        # Checkpointing discards intermediate activations and recomputes
-        # them during backward, trading ~30% slower backward for ~40%
-        # less VRAM. This is a pure memory optimization with zero effect
-        # on training dynamics or convergence.
-        #
-        # NOTE: graph is captured via closure, NOT passed as a positional
-        # arg. torch.utils.checkpoint requires all positional args to be
-        # tensors for gradient tracking. SpatialGraph is a dataclass, so
-        # passing it as an arg breaks the gradient chain for downstream
-        # decoder layers.
+        has_t2 = type2 is not None and self.channels_type2 > 0
         s, v = scalars, vectors
-        for block in self.blocks:
-            if self.training:
-                def _run_block(_s: Tensor, _v: Tensor, _block=block, _g=graph) -> Tuple[Tensor, Tensor]:
-                    return _block(_s, _v, _g)
-                s, v = torch.utils.checkpoint.checkpoint(
-                    _run_block, s, v, use_reentrant=False,
-                )
-            else:
-                s, v = block(s, v, graph)
+        t2 = type2
 
+        for block in self.blocks:
+            if has_t2:
+                if self.training:
+                    def _run_block_t2(_s, _v, _t2, _block=block, _g=graph):
+                        return _block(_s, _v, _g, type2=_t2)
+                    s, v, t2 = torch.utils.checkpoint.checkpoint(
+                        _run_block_t2, s, v, t2, use_reentrant=False,
+                    )
+                else:
+                    s, v, t2 = block(s, v, graph, type2=t2)
+            else:
+                if self.training:
+                    def _run_block(_s, _v, _block=block, _g=graph):
+                        return _block(_s, _v, _g)
+                    s, v = torch.utils.checkpoint.checkpoint(
+                        _run_block, s, v, use_reentrant=False,
+                    )
+                else:
+                    s, v = block(s, v, graph)
+
+        if has_t2:
+            return s, v, t2, graph
         return s, v, graph
 
 
@@ -295,6 +298,7 @@ class MultiScaleSE3Net(nn.Module):
         in_channels: int = 1,
         hidden_scalar: int = 64,
         hidden_vector: int = 16,
+        hidden_type2: int = 0,
         num_stages: int = 3,
         layers_per_stage: int = 2,
         pool_ratio: float = 0.25,
@@ -310,10 +314,12 @@ class MultiScaleSE3Net(nn.Module):
         self.in_channels = in_channels
         self.hidden_scalar = hidden_scalar
         self.hidden_vector = hidden_vector
+        self.hidden_type2 = hidden_type2
         self.num_stages = num_stages
 
         C_s = hidden_scalar
         C_v = hidden_vector
+        C_t2 = hidden_type2
 
         # Input embedding
         self.embed_scalar = nn.Linear(in_channels, C_s)
@@ -326,6 +332,7 @@ class MultiScaleSE3Net(nn.Module):
             self.encoder_stages.append(_EncoderStage(
                 channels_scalar=C_s,
                 channels_vector=C_v,
+                channels_type2=C_t2,
                 num_layers=layers_per_stage,
                 radius_multiplier=radius_multiplier,
                 gate_mode=gate_mode,
@@ -335,6 +342,7 @@ class MultiScaleSE3Net(nn.Module):
                 self.pool_layers.append(EquivariantPool(
                     scalar_channels=C_s,
                     vector_channels=C_v,
+                    type2_channels=C_t2,
                     ratio=pool_ratio,
                     k_neighbors=pool_k,
                 ))
@@ -344,42 +352,43 @@ class MultiScaleSE3Net(nn.Module):
         self.interp_layers = nn.ModuleList()
         self.skip_proj_s = nn.ModuleList()
         self.skip_proj_v = nn.ModuleList()
+        self.skip_proj_t2 = nn.ModuleList()
         self.skip_norms = nn.ModuleList()
 
         for i in range(num_stages - 1):
             self.interp_layers.append(EquivariantInterpolate(k_neighbors=interp_k))
 
-            # After interp + skip concat: C_s*2 → C_s, C_v*2 → C_v
             self.skip_proj_s.append(nn.Linear(C_s * 2, C_s))
             self.skip_proj_v.append(nn.Linear(C_v * 2, C_v, bias=False))
 
-            # Normalize after skip projection — controls scale from
-            # concatenated encoder (possibly inflated) + interpolated features
+            # Type-2 skip projection
+            if C_t2 > 0:
+                self.skip_proj_t2.append(nn.Linear(C_t2 * 2, C_t2, bias=False))
+            else:
+                self.skip_proj_t2.append(None)
+
             self.skip_norms.append(EquivariantLayerNorm(
-                num_scalars=C_s, num_vectors=C_v,
+                num_scalars=C_s, num_vectors=C_v, num_type2=C_t2,
             ))
 
             self.decoder_stages.append(_EncoderStage(
                 channels_scalar=C_s,
                 channels_vector=C_v,
+                channels_type2=C_t2,
                 num_layers=layers_per_stage,
                 radius_multiplier=radius_multiplier,
                 gate_mode=gate_mode,
                 use_self_tp=use_self_tp,
             ))
 
-        # ── Final Norm (Pre-Norm mandatory) ──
+        # ── Final Norm ──
         self.final_norm = EquivariantLayerNorm(
-            num_scalars=C_s, num_vectors=C_v,
+            num_scalars=C_s, num_vectors=C_v, num_type2=C_t2,
         )
 
-        # ── Bottleneck attention (optional) ──
-        # Operates ONLY on l=0 scalars at the deepest (most downsampled)
-        # encoder stage. SO(3)-invariant by construction (scalar-only +
-        # distance RPE). Uses packed→padded→packed conversion.
+        # ── Bottleneck attention (optional, scalar-only) ──
         self.use_bottleneck_attn = use_bottleneck_attn
         if use_bottleneck_attn:
-            # Ensure C_s is divisible by num_heads
             n_heads = min(attn_num_heads, C_s)
             while C_s % n_heads != 0:
                 n_heads -= 1
@@ -399,101 +408,93 @@ class MultiScaleSE3Net(nn.Module):
         batch: Optional[Tensor] = None,
         v_init: Optional[Tensor] = None,
         return_encoder_features: bool = False,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, ...]:
         """Multi-scale feature extraction.
 
         Args:
-            pos: Packed point positions
-                shape: [N_total, 3]
-            ptr: CSR batch offsets
-                shape: [B+1], int64
-            features: Optional input features
-                shape: [N_total, in_channels]
-            batch: Optional batch vector (derived from ptr if None)
-                shape: [N_total], int64
-            v_init: Optional initial vector features (e.g., projected normals)
-                shape: [N_total, hidden_vector, 3]
-                representation: SO(3) type-1 Cartesian vectors
-                If None, vectors are zero-initialized.
-            return_encoder_features: If True, additionally return
-                per-stage encoder scalar features and their ptrs
-                for multi-scale head fusion.
+            pos: [N_total, 3]
+            ptr: [B+1], int64
+            features: Optional [N_total, in_channels]
+            batch: Optional [N_total], int64
+            v_init: Optional [N_total, hidden_vector, 3]
+            return_encoder_features: If True, return per-stage encoder features
 
         Returns:
-            s_out: Per-point scalar features at input resolution
-                shape: [N_total, hidden_scalar]
-            v_out: Per-point vector features at input resolution
-                shape: [N_total, hidden_vector, 3]
-            ptr: Original ptr (unchanged)
-            If return_encoder_features is True, also returns:
-                enc_s_list: List[Tensor] — per-stage encoder scalars
-                enc_ptr_list: List[Tensor] — per-stage batch ptrs
+            Without type-2: (s, v, ptr) or (s, v, ptr, enc_s, enc_ptr)
+            With type-2: (s, v, t2, ptr) or (s, v, t2, ptr, enc_s, enc_ptr)
         """
         N = pos.shape[0]
         C_s = self.hidden_scalar
         C_v = self.hidden_vector
+        C_t2 = self.hidden_type2
+        has_t2 = C_t2 > 0
 
         # Embed input
         if features is None:
             features = pos.new_ones(N, self.in_channels)
-        s = self.embed_scalar(features)  # [N, C_s]
+        s = self.embed_scalar(features)
 
-        # Vector initialization: use provided v_init or zero
         if v_init is not None:
-            v = v_init  # [N, C_v, 3] — e.g., projected normals
+            v = v_init
         else:
-            v = pos.new_zeros(N, C_v, 3)  # zero-init vectors
+            v = pos.new_zeros(N, C_v, 3)
 
-        # Build batch vector from ptr: ZERO GPU→CPU syncs
-        # arange + repeat_interleave is fully GPU-side
+        # Type-2: zero-init (no type-2 input from raw data)
+        t2 = pos.new_zeros(N, C_t2, 5) if has_t2 else None
+
         if batch is None:
             B = ptr.shape[0] - 1
-            counts = ptr[1:] - ptr[:-1]  # [B], stays on device
+            counts = ptr[1:] - ptr[:-1]
             batch = torch.arange(B, device=pos.device).repeat_interleave(counts)
 
-        # ── Encoder: store skip connections ──
+        # ── Encoder ──
         enc_s_list: List[Tensor] = []
         enc_v_list: List[Tensor] = []
+        enc_t2_list: List[Optional[Tensor]] = []
         enc_pos_list: List[Tensor] = []
         enc_ptr_list: List[Tensor] = []
         enc_batch_list: List[Tensor] = []
+        enc_graph_list: List[SpatialGraph] = []
 
         cur_pos = pos
         cur_ptr = ptr
         cur_batch = batch
 
-        enc_graph_list: List[SpatialGraph] = []
-
         for i in range(self.num_stages):
-            # SE3Conv blocks at this scale (returns graph for decoder reuse)
-            s, v, enc_graph = self.encoder_stages[i](
-                s, v, cur_pos, cur_ptr, cur_batch
-            )
+            if has_t2:
+                s, v, t2, enc_graph = self.encoder_stages[i](
+                    s, v, cur_pos, cur_ptr, cur_batch, type2=t2
+                )
+            else:
+                s, v, enc_graph = self.encoder_stages[i](
+                    s, v, cur_pos, cur_ptr, cur_batch
+                )
 
-            # Store for skip connection (features + graph)
             enc_s_list.append(s)
             enc_v_list.append(v)
+            enc_t2_list.append(t2 if has_t2 else None)
             enc_pos_list.append(cur_pos)
             enc_ptr_list.append(cur_ptr)
             enc_batch_list.append(cur_batch)
             enc_graph_list.append(enc_graph)
 
-            # Downsample (except last stage)
             if i < self.num_stages - 1:
-                cur_pos, s, v, cur_ptr, fps_idx = self.pool_layers[i](
-                    cur_pos, s, v, cur_ptr
-                )
-                # Build batch vector for downsampled points
+                if has_t2:
+                    cur_pos, s, v, t2, cur_ptr, fps_idx = self.pool_layers[i](
+                        cur_pos, s, v, cur_ptr, type2=t2
+                    )
+                else:
+                    cur_pos, s, v, cur_ptr, fps_idx = self.pool_layers[i](
+                        cur_pos, s, v, cur_ptr
+                    )
                 cur_batch = enc_batch_list[-1][fps_idx]
 
-        # ── Bottleneck attention (scalar-only, SO(3)-invariant) ──
+        # ── Bottleneck attention (scalar-only) ──
         if self.use_bottleneck_attn:
-            # Convert packed → padded for batched attention
             B_bn = cur_ptr.shape[0] - 1
-            counts_bn = cur_ptr[1:] - cur_ptr[:-1]  # [B_bn]
+            counts_bn = cur_ptr[1:] - cur_ptr[:-1]
             N_max = counts_bn.max().item()
 
-            # Pad scalars: [N_total, C_s] → [B_bn, N_max, C_s]
             s_padded = s.new_zeros(B_bn, N_max, s.shape[-1])
             pos_padded = cur_pos.new_zeros(B_bn, N_max, 3)
             mask_padded = torch.zeros(B_bn, N_max, dtype=torch.bool, device=s.device)
@@ -506,65 +507,83 @@ class MultiScaleSE3Net(nn.Module):
                 pos_padded[b_idx, :n_b] = cur_pos[start:end]
                 mask_padded[b_idx, :n_b] = True
 
-            # Run attention: [B, N_max, C_s] → [B, N_max, C_s]
             s_padded = self.bottleneck_attn(s_padded, pos_padded, mask=mask_padded)
 
-            # Unpad: [B, N_max, C_s] → [N_total, C_s]
             for b_idx in range(B_bn):
                 start = cur_ptr[b_idx].item()
                 end = cur_ptr[b_idx + 1].item()
                 n_b = end - start
                 s[start:end] = s_padded[b_idx, :n_b]
 
-        # ── Decoder: upsample + skip + process ──
+        # ── Decoder ──
         for i in range(self.num_stages - 2, -1, -1):
-            # Upsample from coarse to encoder resolution i
-            s_interp, v_interp = self.interp_layers[i](
-                enc_pos_list[i],     # dense (target)
-                cur_pos,              # coarse (source)
-                s, v,
-                enc_ptr_list[i],     # dense ptr
-                cur_ptr,              # coarse ptr
-                s_skip=enc_s_list[i],
-                v_skip=enc_v_list[i],
-            )
-            # s_interp: [N_i, C_s * 2], v_interp: [N_i, C_v * 2, 3]
+            if has_t2:
+                s_interp, v_interp, t2_interp = self.interp_layers[i](
+                    enc_pos_list[i], cur_pos, s, v,
+                    enc_ptr_list[i], cur_ptr,
+                    s_skip=enc_s_list[i], v_skip=enc_v_list[i],
+                    t2_coarse=t2, t2_skip=enc_t2_list[i],
+                )
+            else:
+                s_interp, v_interp = self.interp_layers[i](
+                    enc_pos_list[i], cur_pos, s, v,
+                    enc_ptr_list[i], cur_ptr,
+                    s_skip=enc_s_list[i], v_skip=enc_v_list[i],
+                )
 
-            # Project back to C_s, C_v
-            s = self.skip_proj_s[i](s_interp)  # [N_i, C_s]
+            # Project back
+            s = self.skip_proj_s[i](s_interp)
 
-            # For vectors: project channel dim while preserving spatial dim
-            # v_interp: [N_i, C_v*2, 3] → reshape → project → reshape
             N_i = v_interp.shape[0]
-            v_flat = v_interp.transpose(1, 2).reshape(N_i * 3, C_v * 2)  # [N_i*3, C_v*2]
-            v_proj = self.skip_proj_v[i](v_flat)  # [N_i*3, C_v]
-            v = v_proj.reshape(N_i, 3, C_v).transpose(1, 2)  # [N_i, C_v, 3]
+            v_flat = v_interp.transpose(1, 2).reshape(N_i * 3, C_v * 2)
+            v_proj = self.skip_proj_v[i](v_flat)
+            v = v_proj.reshape(N_i, 3, C_v).transpose(1, 2)
 
-            # Skip norm: control scale after concat + projection
-            s, v = self.skip_norms[i](s, v)
+            if has_t2:
+                # t2_interp: [N_i, C_t2*2, 5] → project → [N_i, C_t2, 5]
+                t2_flat = t2_interp.transpose(1, 2).reshape(N_i * 5, C_t2 * 2)
+                t2_proj = self.skip_proj_t2[i](t2_flat)
+                t2 = t2_proj.reshape(N_i, 5, C_t2).transpose(1, 2)
 
-            # Restore resolution
+            # Skip norm
+            if has_t2:
+                s, v, t2 = self.skip_norms[i](s, v, t2)
+            else:
+                s, v = self.skip_norms[i](s, v)
+
             cur_pos = enc_pos_list[i]
             cur_ptr = enc_ptr_list[i]
             cur_batch = enc_batch_list[i]
 
-            # SE3Conv blocks at this scale — REUSE encoder graph
-            # (same positions → same topology + edge_vec + SH)
-            s, v, _ = self.decoder_stages[i](
-                s, v, cur_pos, cur_ptr, cur_batch,
-                graph=enc_graph_list[i],
-            )
+            if has_t2:
+                s, v, t2, _ = self.decoder_stages[i](
+                    s, v, cur_pos, cur_ptr, cur_batch,
+                    graph=enc_graph_list[i], type2=t2,
+                )
+            else:
+                s, v, _ = self.decoder_stages[i](
+                    s, v, cur_pos, cur_ptr, cur_batch,
+                    graph=enc_graph_list[i],
+                )
 
-        # Final norm (Pre-Norm mandatory)
-        s, v = self.final_norm(s, v)
+        # Final norm
+        if has_t2:
+            s, v, t2 = self.final_norm(s, v, t2)
+        else:
+            s, v = self.final_norm(s, v)
 
-        if return_encoder_features:
-            return s, v, ptr, enc_s_list, enc_ptr_list
-        return s, v, ptr
+        if has_t2:
+            if return_encoder_features:
+                return s, v, t2, ptr, enc_s_list, enc_ptr_list
+            return s, v, t2, ptr
+        else:
+            if return_encoder_features:
+                return s, v, ptr, enc_s_list, enc_ptr_list
+            return s, v, ptr
 
     def extra_repr(self) -> str:
         return (
             f"in={self.in_channels}, "
             f"hidden_s={self.hidden_scalar}, hidden_v={self.hidden_vector}, "
-            f"stages={self.num_stages}"
+            f"hidden_t2={self.hidden_type2}, stages={self.num_stages}"
         )

@@ -3,28 +3,28 @@
 
 """Gated nonlinearity for equivariant neural networks.
 
-Standard nonlinearities (ReLU, GELU) cannot be applied to vector (l≥1)
-features because they break equivariance. The solution is gate vectors
+Standard nonlinearities (ReLU, GELU) cannot be applied to l≥1 features
+because they break equivariance. The solution is gate higher-order features
 using scalar-derived gates:
 
     scalar_out = σ(scalar_in)
     vector_out = gate(scalar_in) * vector_in
+    type2_out  = gate(scalar_in) * type2_in
 
-Since the gate is an SO(3)-invariant scalar, multiplying it with a vector
-preserves equivariance: R(gate * v) = gate * Rv.
+Since the gate is an SO(3)-invariant scalar, multiplying it with any
+equivariant feature preserves equivariance: D^l(R)(gate * f) = gate * D^l(R)f.
 
 **Norm mode** (gate_mode='norm'):
-    Combines scalar-derived gate with norm-based activation.
-    v_out = activation(W_gate @ s + W_norm @ ||v||) * v / ||v||
-    This allows the nonlinearity to *change* vector amplitude based on
-    both scalar context AND vector magnitude, while strictly preserving
-    direction (and therefore equivariance).
+    Combines scalar-derived gate with norm-based activation for l≥1 features.
+    f_out = activation(W_gate @ s + W_norm @ ||f||) * f / ||f||
+    This allows the nonlinearity to *change* feature amplitude based on
+    both scalar context AND feature magnitude, while strictly preserving
+    the transformation rule (and therefore equivariance).
 
-    Equivariance proof:
-        ||Rv|| = ||v||, so the scalar gate is invariant.
-        v/||v|| transforms as Rv/||Rv|| = R(v/||v||).
-        Therefore: gate(s, ||Rv||) * Rv/||Rv|| = gate(s, ||v||) * R(v/||v||)
-                 = R * [gate(s, ||v||) * v/||v||]  QED
+    Equivariance proof for any l:
+        ||D^l(R)f|| = ||f|| (Wigner-D is unitary), so the gate is invariant.
+        f/||f|| transforms as D^l(R)f/||D^l(R)f|| = D^l(R)(f/||f||).
+        Therefore: gate(s, ||f||) * D^l(R)f/||f|| = D^l(R) * [gate(s, ||f||) * f/||f||]
 """
 
 import torch
@@ -35,36 +35,26 @@ from torch import Tensor
 class GatedNonlinearity(nn.Module):
     """Gated nonlinearity that preserves SO(3) equivariance.
 
-    Applies standard nonlinearity to scalar features. For vector features,
-    generates scalar gates from a linear projection and multiplies:
-
-        s_out = activation(s_in)
-        v_out = sigmoid(W_gate @ s_in) ⊙ v_in          (mode='scalar')
-        v_out = σ(W_gate @ s + W_norm @ ||v||) * v/||v|| (mode='norm')
-
-    The gate values are SO(3)-invariant scalars, so the output vectors
-    remain equivariant.
+    Applies standard nonlinearity to scalar features. For l≥1 features
+    (vectors, type-2 tensors), generates scalar gates from a linear
+    projection and multiplies.
 
     Args:
         num_scalars: Number of scalar input/output channels
         num_vectors: Number of vector input/output channels
+        num_type2: Number of type-2 (l=2) input/output channels
         scalar_activation: Activation for scalar features (default: SiLU)
-        gate_activation: Activation for vector gates (default: sigmoid)
+        gate_activation: Activation for gates (default: sigmoid)
         gate_mode: 'scalar' (default) or 'norm'
             'scalar': gate = σ(W @ s_in)
-            'norm': gate = σ(W_s @ s_in + W_n @ ||v|| + b)
-
-    Example::
-
-        >>> gate = GatedNonlinearity(num_scalars=64, num_vectors=16)
-        >>> s, v = torch.randn(B, N, 64), torch.randn(B, N, 16, 3)
-        >>> s_out, v_out = gate(s, v)
+            'norm': gate = σ(W_s @ s + W_n @ ||f|| + b)
     """
 
     def __init__(
         self,
         num_scalars: int,
         num_vectors: int = 0,
+        num_type2: int = 0,
         scalar_activation: str = "silu",
         gate_activation: str = "sigmoid",
         gate_mode: str = "scalar",
@@ -72,6 +62,7 @@ class GatedNonlinearity(nn.Module):
         super().__init__()
         self.num_scalars = num_scalars
         self.num_vectors = num_vectors
+        self.num_type2 = num_type2
         self.gate_mode = gate_mode
 
         # Scalar nonlinearity
@@ -83,62 +74,94 @@ class GatedNonlinearity(nn.Module):
         }
         self.scalar_act = activations.get(scalar_activation, nn.SiLU())
 
-        # Gate nonlinearity (produces values in [0, 1])
+        # Gate nonlinearity
         gate_activations = {
             "sigmoid": nn.Sigmoid(),
-            "tanh_abs": nn.Tanh(),  # will take abs() in forward
+            "tanh_abs": nn.Tanh(),
         }
         self.gate_act = gate_activations.get(gate_activation, nn.Sigmoid())
 
-        # Linear projection: scalar features → gate values
+        # ── Vector gate ──
         if num_vectors > 0:
-            self.gate_proj = nn.Linear(num_scalars, num_vectors, bias=True)
-
-            # Norm mode: additional projection from vector norms
+            self.gate_proj_v = nn.Linear(num_scalars, num_vectors, bias=True)
             if gate_mode == 'norm':
-                self.norm_proj = nn.Linear(num_vectors, num_vectors, bias=False)
+                self.norm_proj_v = nn.Linear(num_vectors, num_vectors, bias=False)
         else:
-            self.gate_proj = None
+            self.gate_proj_v = None
+
+        # ── Type-2 gate ──
+        if num_type2 > 0:
+            self.gate_proj_t2 = nn.Linear(num_scalars, num_type2, bias=True)
+            if gate_mode == 'norm':
+                self.norm_proj_t2 = nn.Linear(num_type2, num_type2, bias=False)
+        else:
+            self.gate_proj_t2 = None
+
+    def _gate_features(
+        self,
+        scalars: Tensor,
+        features: Tensor,
+        gate_proj: nn.Linear,
+        norm_proj: nn.Linear | None,
+    ) -> Tensor:
+        """Apply gating to l≥1 features.
+
+        Args:
+            scalars: [..., C_s]
+            features: [..., C_f, D] where D=3 (l=1) or D=5 (l=2)
+            gate_proj: Linear(C_s → C_f)
+            norm_proj: Linear(C_f → C_f) or None (only for norm mode)
+
+        Returns:
+            Gated features, same shape as input
+        """
+        if self.gate_mode == 'norm' and norm_proj is not None:
+            # ||f||: [..., C_f] — SO(3) invariant (Rule 4: clamp for safety)
+            f_norm = features.norm(dim=-1).clamp(min=1e-8)  # [..., C_f]
+            f_hat = features / f_norm.unsqueeze(-1)  # unit direction
+
+            # Gate input: W_s @ s + W_n @ ||f||
+            gate_input = gate_proj(scalars) + norm_proj(f_norm)
+            gates = self.gate_act(gate_input)  # [..., C_f], in [0,1]
+
+            # Scale = gate * original_norm
+            return (gates * f_norm).unsqueeze(-1) * f_hat  # [..., C_f, D]
+        else:
+            # Standard scalar gate
+            gates = self.gate_act(gate_proj(scalars))  # [..., C_f]
+            return features * gates.unsqueeze(-1)  # [..., C_f, D]
 
     def forward(
         self,
         scalars: Tensor,
         vectors: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+        type2: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         """Apply gated nonlinearity.
 
         Args:
-            scalars: Scalar features
-                shape: [..., num_scalars]
-            vectors: Vector features
-                shape: [..., num_vectors, 3]
+            scalars: [..., num_scalars]
+            vectors: [..., num_vectors, 3]
+            type2: [..., num_type2, 5] or None
 
         Returns:
-            Tuple of (activated_scalars, gated_vectors)
+            If type2 is None: (activated_scalars, gated_vectors)
+            If type2 is given: (activated_scalars, gated_vectors, gated_type2)
         """
-        # Scalar: standard nonlinearity (equivariance-safe for l=0)
         s_out = self.scalar_act(scalars)
 
-        # Vector: gate using scalar-derived values
-        if self.gate_proj is not None and vectors.shape[-2] > 0:
-            if self.gate_mode == 'norm':
-                # Norm-based gate: combines scalar context + vector magnitude
-                # ||v||: [..., C_v] — SO(3) invariant (Rule 4: clamp for safety)
-                v_norm = vectors.norm(dim=-1).clamp(min=1e-8)  # [..., C_v]
-                v_hat = vectors / v_norm.unsqueeze(-1)  # unit direction
-
-                # Gate input: W_s @ s + W_n @ ||v||
-                gate_input = self.gate_proj(scalars) + self.norm_proj(v_norm)
-                gates = self.gate_act(gate_input)  # [..., C_v], in [0,1]
-
-                # Scale = gate * original_norm (re-modulate magnitude)
-                v_out = (gates * v_norm).unsqueeze(-1) * v_hat  # [..., C_v, 3]
-            else:
-                # Standard scalar gate
-                gates = self.gate_act(self.gate_proj(scalars))  # [..., num_vectors]
-                v_out = vectors * gates.unsqueeze(-1)  # [..., num_vectors, 3]
+        # Vector gate
+        if self.gate_proj_v is not None and vectors.shape[-2] > 0:
+            norm_proj = getattr(self, 'norm_proj_v', None)
+            v_out = self._gate_features(scalars, vectors, self.gate_proj_v, norm_proj)
         else:
             v_out = vectors
+
+        # Type-2 gate
+        if type2 is not None and self.gate_proj_t2 is not None:
+            norm_proj = getattr(self, 'norm_proj_t2', None)
+            t2_out = self._gate_features(scalars, type2, self.gate_proj_t2, norm_proj)
+            return s_out, v_out, t2_out
 
         return s_out, v_out
 
@@ -146,5 +169,6 @@ class GatedNonlinearity(nn.Module):
         return (
             f"num_scalars={self.num_scalars}, "
             f"num_vectors={self.num_vectors}, "
+            f"num_type2={self.num_type2}, "
             f"gate_mode={self.gate_mode}"
         )

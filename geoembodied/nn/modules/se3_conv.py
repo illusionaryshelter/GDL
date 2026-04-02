@@ -19,9 +19,10 @@ Architecture:
 Feature representation:
     - Scalar (l=0): shape [N, C_scalar]
     - Vector (l=1): shape [N, C_vector, 3]
+    - Type-2 (l=2): shape [N, C_type2, 5]
 
 The equivariance guarantee:
-    f(Rp + t) = R ⊳ f(p)  for all R ∈ SO(3), t ∈ R³
+    f(Rp + t) = D^l(R) ⊳ f(p)  for all R ∈ SO(3), t ∈ R³
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ from torch.amp import autocast
 
 from geoembodied.functional.radius_graph import radius_graph, compute_edge_vectors
 from geoembodied.functional.segment_reduce import segment_reduce
+from geoembodied.functional.tensor_product import get_cg_matrix
 from geoembodied.kernels.triton_sph_harm import spherical_harmonics
 
 if TYPE_CHECKING:
@@ -51,9 +53,6 @@ if TYPE_CHECKING:
 # graph topologies). torch.compile(dynamic=True) caches compiled kernels
 # for each distinct E, causing continuous GPU memory growth — a known
 # PyTorch bug (issues #174468, #128424, #119607, #177869).
-# The tensor products below are already memory-bandwidth-bound (gather +
-# matmul + scatter), so compile offers <5% speedup at the cost of ~15GB
-# VRAM leak over a training run.
 
 def _compute_messages(
     s_src: Tensor,          # [E, C_s_in]  source scalar features
@@ -68,13 +67,17 @@ def _compute_messages(
     w_vv_cross: Optional[Tensor], # [C_v_out, C_v_in]  or None
     Cs_out: int,
     Cv_out: int,
-) -> Tuple[Tensor, Tensor]:
-    """Compute all 5 tensor-product path messages for SE3Conv.
-
-    This is a **pure function** operating on per-edge tensors only.
-    No graph topology, no dynamic shapes, no side effects.
-    All operations are cuBLAS matmuls or element-wise — ideal for
-    ``torch.compile`` fusion by the caller (SE3Net/user code).
+    # ── Type-2 paths (optional) ──
+    t2_src: Optional[Tensor] = None,   # [E, C_t2_in, 5]
+    Y_2: Optional[Tensor] = None,      # [E, 5]
+    w_st2: Optional[Tensor] = None,    # [C_t2_out, C_s_in]
+    w_t2t2: Optional[Tensor] = None,   # [C_t2_out, C_t2_in]
+    w_vt2: Optional[Tensor] = None,    # [C_t2_out, C_v_in]
+    w_t2s: Optional[Tensor] = None,    # [C_s_out, C_t2_in]
+    cg_11_2: Optional[Tensor] = None,  # [9, 5] CG matrix
+    Ct2_out: int = 0,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Compute all tensor-product path messages for SE3Conv.
 
     TP Paths (filter_l × feature_l → output_l):
         Path 0: Y_0 × f_scalar → f_scalar     (scalar pass-through)
@@ -82,29 +85,14 @@ def _compute_messages(
         Path 2: Y_0 × f_vector → f_vector      (vector pass-through)
         Path 3: dir · f_vector → f_scalar      (dot product, invariant)
         Path 4: dir × f_vector → f_vector      (cross product, equivariant)
-
-    Args:
-        s_src: Source scalar features, shape: [E, C_s_in]
-        v_src: Source vector features, shape: [E, C_v_in, 3]
-            representation: SO(3) type-1 Cartesian vectors
-        direction: Unit direction vectors, shape: [E, 3]
-        Y_0: l=0 spherical harmonic coefficient, shape: [E, 1]
-        R: Radial weights per path, shape: [E, num_active_paths]
-        w_ss..w_vv_cross: Weight matrices for each path (transposed
-            from nn.Linear convention: [C_out, C_in]), or None if inactive
-        Cs_out: Output scalar channels
-        Cv_out: Output vector channels
+        Path 5: Y_2 × f_scalar → f_type2       (SH filter → type-2)
+        Path 6: Y_0 × f_type2 → f_type2        (type-2 pass-through)
+        Path 7: dir ⊗ f_vector → f_type2       (CG l=1⊗l=1→l=2)
+        Path 8: ||f_type2||² → f_scalar        (invariant contraction)
 
     Returns:
-        (scalar_msg, vector_msg):
-            scalar_msg: [E, C_s_out] — per-edge scalar messages
-            vector_msg: [E, C_v_out, 3] — per-edge vector messages
+        (scalar_msg, vector_msg, type2_msg)
     """
-    # ⚠ AMP PROTECTION (Landmine 3): Geometric tensor product paths
-    # require at least FP32. torch.linalg.cross does not support FP16,
-    # and direction/SH multiplications lose critical precision in half.
-    # Strategy: upcast FP16/BF16 → FP32, but PRESERVE FP64 for
-    # double-precision equivariance tests.
     E = s_src.shape[0]
     device = s_src.device
 
@@ -113,7 +101,7 @@ def _compute_messages(
     if input_dtype in (torch.float16, torch.bfloat16):
         compute_dtype = torch.float32
     else:
-        compute_dtype = input_dtype  # float32 or float64, keep as-is
+        compute_dtype = input_dtype
 
     s_src = s_src.to(compute_dtype)
     v_src = v_src.to(compute_dtype)
@@ -121,7 +109,7 @@ def _compute_messages(
     Y_0 = Y_0.to(compute_dtype)
     R = R.to(compute_dtype)
 
-    # Also cast weight matrices to match compute dtype
+    # Cast weight matrices
     if w_ss is not None:
         w_ss = w_ss.to(compute_dtype)
     if w_sv is not None:
@@ -133,53 +121,119 @@ def _compute_messages(
     if w_vv_cross is not None:
         w_vv_cross = w_vv_cross.to(compute_dtype)
 
+    # Type-2 casts
+    if t2_src is not None:
+        t2_src = t2_src.to(compute_dtype)
+    if Y_2 is not None:
+        Y_2 = Y_2.to(compute_dtype)
+    if w_st2 is not None:
+        w_st2 = w_st2.to(compute_dtype)
+    if w_t2t2 is not None:
+        w_t2t2 = w_t2t2.to(compute_dtype)
+    if w_vt2 is not None:
+        w_vt2 = w_vt2.to(compute_dtype)
+    if w_t2s is not None:
+        w_t2s = w_t2s.to(compute_dtype)
+    if cg_11_2 is not None:
+        cg_11_2 = cg_11_2.to(compute_dtype)
+
     total_scalar_msg = s_src.new_zeros(E, Cs_out)
     total_vector_msg = v_src.new_zeros(E, Cv_out, 3)
+    total_type2_msg = None
+    if Ct2_out > 0:
+        total_type2_msg = s_src.new_zeros(E, Ct2_out, 5)
 
     path_idx = 0
 
     # Path 0: Y_0 × f_s → f_s  (cuBLAS matmul)
     if w_ss is not None:
-        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
-        # nn.Linear stores weight as [C_out, C_in], matmul: s_src @ W^T
+        r_weight = R[:, path_idx:path_idx+1]
         total_scalar_msg = total_scalar_msg + r_weight * Y_0 * (s_src @ w_ss.t())
         path_idx += 1
 
     # Path 1: direction × f_s → f_v
     if w_sv is not None:
-        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
+        r_weight = R[:, path_idx:path_idx+1]
         mixed = r_weight * (s_src @ w_sv.t())  # [E, C_v_out]
         total_vector_msg = total_vector_msg + mixed.unsqueeze(-1) * direction.unsqueeze(-2)
         path_idx += 1
 
     # Path 2: Y_0 × f_v → f_v
     if w_vv_scalar is not None:
-        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
-        # v_src: [E, C_v_in, 3], weight: [C_v_out, C_v_in]
-        # → (E, 3, C_v_in) @ (C_v_in, C_v_out) → (E, 3, C_v_out) → transpose
+        r_weight = R[:, path_idx:path_idx+1]
         mixed = (v_src.transpose(-1, -2) @ w_vv_scalar.t()).transpose(-1, -2)
         total_vector_msg = total_vector_msg + r_weight.unsqueeze(-1) * Y_0.unsqueeze(-1) * mixed
         path_idx += 1
 
     # Path 3: direction · f_v → f_s (invariant dot product)
     if w_vs is not None:
-        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
+        r_weight = R[:, path_idx:path_idx+1]
         dot = (direction.unsqueeze(-2) * v_src).sum(dim=-1)  # [E, C_v_in]
         total_scalar_msg = total_scalar_msg + r_weight * (dot @ w_vs.t())
         path_idx += 1
 
     # Path 4: direction × f_v → f_v (equivariant cross product)
     if w_vv_cross is not None:
-        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
+        r_weight = R[:, path_idx:path_idx+1]
         cross = torch.linalg.cross(
             direction.unsqueeze(-2).expand_as(v_src),
             v_src, dim=-1,
-        )  # [E, C_v_in, 3]
+        )
         mixed = (cross.transpose(-1, -2) @ w_vv_cross.t()).transpose(-1, -2)
         total_vector_msg = total_vector_msg + r_weight.unsqueeze(-1) * mixed
         path_idx += 1
 
-    return total_scalar_msg, total_vector_msg
+    # ── Type-2 paths ──
+
+    # Path 5: Y_2 × f_s → f_t2  (SH filter → type-2)
+    # Y_2: [E, 5], s_src: [E, C_s_in], w_st2: [C_t2_out, C_s_in]
+    # Result: [E, C_t2_out, 5]
+    if w_st2 is not None and Y_2 is not None and total_type2_msg is not None:
+        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
+        mixed = r_weight * (s_src @ w_st2.t())  # [E, C_t2_out]
+        total_type2_msg = total_type2_msg + mixed.unsqueeze(-1) * Y_2.unsqueeze(-2)
+        path_idx += 1
+
+    # Path 6: Y_0 × f_t2 → f_t2  (type-2 pass-through)
+    if w_t2t2 is not None and t2_src is not None and total_type2_msg is not None:
+        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
+        # t2_src: [E, C_t2_in, 5], w_t2t2: [C_t2_out, C_t2_in]
+        mixed = (t2_src.transpose(-1, -2) @ w_t2t2.t()).transpose(-1, -2)
+        total_type2_msg = total_type2_msg + r_weight.unsqueeze(-1) * Y_0.unsqueeze(-1) * mixed
+        path_idx += 1
+
+    # Path 7: dir ⊗ f_v → f_t2 via CG(1,1,2)
+    # CG uses SH l=1 ordering: (Y_{1,-1}, Y_{1,0}, Y_{1,1}) = (y, z, x)
+    # But direction and v_src are Cartesian (x, y, z).
+    # Must permute both to SH order before outer product.
+    # Perm: Cartesian→SH = [1, 2, 0] (y, z, x)
+    if w_vt2 is not None and cg_11_2 is not None and total_type2_msg is not None:
+        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
+        # Permute to SH l=1 ordering: (x,y,z) → (y,z,x)
+        dir_sh = direction[:, [1, 2, 0]]           # [E, 3] in SH order
+        v_sh = v_src[:, :, [1, 2, 0]]              # [E, Cv, 3] in SH order
+        # Outer product: dir_sh[E,3] ⊗ v_sh[E,Cv,3] → [E,Cv,3,3]
+        dir_exp = dir_sh.unsqueeze(1).unsqueeze(-1)  # [E, 1, 3, 1]
+        v_exp = v_sh.unsqueeze(-2)                    # [E, Cv, 1, 3]
+        outer = dir_exp * v_exp                       # [E, Cv, 3, 3]
+        # [E, Cv, 3, 3] → [E, Cv, 9]
+        outer_flat = outer.reshape(E, v_src.shape[1], 9)
+        # CG contraction: [E, Cv, 9] @ [9, 5] → [E, Cv, 5]
+        tp_result = outer_flat @ cg_11_2  # [E, C_v_in, 5]
+        # Channel mixing: [E, 5, C_v_in] @ [C_v_in, C_t2_out] → [E, 5, C_t2_out] → transpose
+        mixed = (tp_result.transpose(-1, -2) @ w_vt2.t()).transpose(-1, -2)  # [E, C_t2_out, 5]
+        total_type2_msg = total_type2_msg + r_weight.unsqueeze(-1) * mixed
+        path_idx += 1
+
+    # Path 8: ||f_t2||² → f_s  (invariant contraction)
+    # t2_src: [E, C_t2_in, 5] → sum_m t2²[c,m] → [E, C_t2_in]
+    if w_t2s is not None and t2_src is not None:
+        r_weight = R[:, path_idx:path_idx+1]  # [E, 1]
+        t2_norm_sq = (t2_src * t2_src).sum(dim=-1)  # [E, C_t2_in]
+        total_scalar_msg = total_scalar_msg + r_weight * (t2_norm_sq @ w_t2s.t())
+        path_idx += 1
+
+    return total_scalar_msg, total_vector_msg, total_type2_msg
 
 
 class RadialBasis(nn.Module):
@@ -206,11 +260,9 @@ class RadialBasis(nn.Module):
         self.cutoff = cutoff
         self.num_basis = num_basis
 
-        # Sinusoidal basis frequencies
         freqs = torch.arange(1, num_basis + 1).float() * math.pi / cutoff
         self.register_buffer('freqs', freqs)
 
-        # MLP: basis → weights
         self.mlp = nn.Sequential(
             nn.Linear(num_basis, num_hidden),
             nn.SiLU(),
@@ -226,61 +278,40 @@ class RadialBasis(nn.Module):
         Returns:
             Radial weights, shape: [E, num_output]
         """
-        # Sinusoidal basis: [E, num_basis]
-        d = dist.unsqueeze(-1)  # [E, 1]
-        basis = torch.sin(self.freqs * d) / d.clamp(min=1e-8)  # [E, B]
-
-        # Cosine cutoff envelope (smooth to zero at boundary)
+        d = dist.unsqueeze(-1)
+        basis = torch.sin(self.freqs * d) / d.clamp(min=1e-8)
         envelope = 0.5 * (1.0 + torch.cos(math.pi * dist / self.cutoff))
-        envelope = envelope.clamp(min=0.0).unsqueeze(-1)  # [E, 1]
-
-        return self.mlp(basis * envelope)  # [E, num_output]
+        envelope = envelope.clamp(min=0.0).unsqueeze(-1)
+        return self.mlp(basis * envelope)
 
 
 class SE3Conv(nn.Module):
     """SE(3)-equivariant continuous convolution on point clouds.
 
-    Processes both scalar (l=0) and vector (l=1) features through
-    tensor product with spherical harmonic filters.
+    Processes scalar (l=0), vector (l=1), and optionally type-2 (l=2)
+    features through tensor product with spherical harmonic filters.
 
     Tensor product paths (filter_l × feature_l → output_l):
         Path 0: Y_0 × f_scalar → f_scalar     (scalar filter × scalar)
         Path 1: Y_1 × f_scalar → f_vector      (vector filter → vector out)
-        Path 2: Y_0 × f_vector → f_vector      (scalar filter × vector, keep)
+        Path 2: Y_0 × f_vector → f_vector      (scalar filter × vector)
         Path 3: Y_1 × f_vector → f_scalar      (dot product: vector→scalar)
         Path 4: Y_1 × f_vector → f_vector      (cross product: vector→vector)
-
-    Each path has a learnable radial weight R_path(d).
+        Path 5: Y_2 × f_scalar → f_type2       (SH filter → type-2)
+        Path 6: Y_0 × f_type2 → f_type2        (type-2 pass-through)
+        Path 7: Y_1 ⊗ f_vector → f_type2       (CG l=1⊗l=1→l=2)
+        Path 8: ||f_type2||² → f_scalar        (invariant contraction)
 
     Args:
         in_scalar_channels: Input scalar feature dimension
         in_vector_channels: Input vector feature dimension
         out_scalar_channels: Output scalar feature dimension
         out_vector_channels: Output vector feature dimension
+        in_type2_channels: Input type-2 feature dimension (0 to disable)
+        out_type2_channels: Output type-2 feature dimension (0 to disable)
         radius: Neighborhood radius
         max_num_neighbors: Maximum neighbors per node
         num_radial_basis: Number of radial basis functions
-
-    Example::
-
-        >>> conv = SE3Conv(
-        ...     in_scalar_channels=64, in_vector_channels=16,
-        ...     out_scalar_channels=64, out_vector_channels=16,
-        ...     radius=2.0,
-        ... )
-        >>> pos = torch.randn(100, 3)
-        >>> s_in = torch.randn(100, 64)
-        >>> v_in = torch.randn(100, 16, 3)
-        >>> s_out, v_out = conv(pos, s_in, v_in)
-
-    .. note:: **torch.compile integration:**
-        This layer is designed for ``torch.compile`` at the **SE3Net or user
-        level**, not per-layer. The inner message computation
-        (``_compute_messages``) is a pure function of per-edge tensors
-        (fixed shapes), and ``segment_reduce`` is registered as a
-        ``torch.library.custom_op`` — both are compile-transparent.
-        The dynamic-shape gather (``scalars[graph.row]``) is left outside
-        the compiled region automatically by the Dynamo tracer.
     """
 
     def __init__(
@@ -289,6 +320,8 @@ class SE3Conv(nn.Module):
         in_vector_channels: int,
         out_scalar_channels: int,
         out_vector_channels: int,
+        in_type2_channels: int = 0,
+        out_type2_channels: int = 0,
         radius: float = 2.0,
         max_num_neighbors: int = 32,
         num_radial_basis: int = 16,
@@ -298,48 +331,83 @@ class SE3Conv(nn.Module):
         self.in_vector_channels = in_vector_channels
         self.out_scalar_channels = out_scalar_channels
         self.out_vector_channels = out_vector_channels
+        self.in_type2_channels = in_type2_channels
+        self.out_type2_channels = out_type2_channels
         self.radius = radius
         self.max_num_neighbors = max_num_neighbors
 
         # Count active tensor product paths
         self._num_paths = 0
 
-        # Path 0: Y_0 × f_s → f_s (scalar × scalar → scalar)
+        # Path 0: Y_0 × f_s → f_s
         if in_scalar_channels > 0 and out_scalar_channels > 0:
             self.w_ss = nn.Linear(in_scalar_channels, out_scalar_channels, bias=False)
             self._num_paths += 1
         else:
             self.w_ss = None
 
-        # Path 1: Y_1 × f_s → f_v (vector filter × scalar → vector)
+        # Path 1: Y_1 × f_s → f_v
         if in_scalar_channels > 0 and out_vector_channels > 0:
             self.w_sv = nn.Linear(in_scalar_channels, out_vector_channels, bias=False)
             self._num_paths += 1
         else:
             self.w_sv = None
 
-        # Path 2: Y_0 × f_v → f_v (scalar filter × vector → vector, keep)
+        # Path 2: Y_0 × f_v → f_v
         if in_vector_channels > 0 and out_vector_channels > 0:
             self.w_vv_scalar = nn.Linear(in_vector_channels, out_vector_channels, bias=False)
             self._num_paths += 1
         else:
             self.w_vv_scalar = None
 
-        # Path 3: Y_1 · f_v → f_s (dot product: vector → scalar, invariant)
+        # Path 3: Y_1 · f_v → f_s (invariant)
         if in_vector_channels > 0 and out_scalar_channels > 0:
             self.w_vs = nn.Linear(in_vector_channels, out_scalar_channels, bias=False)
             self._num_paths += 1
         else:
             self.w_vs = None
 
-        # Path 4: Y_1 × f_v → f_v (cross product: vector → vector)
+        # Path 4: Y_1 × f_v → f_v (cross product)
         if in_vector_channels > 0 and out_vector_channels > 0:
             self.w_vv_cross = nn.Linear(in_vector_channels, out_vector_channels, bias=False)
             self._num_paths += 1
         else:
             self.w_vv_cross = None
 
-        # Radial basis for distance-dependent weighting
+        # ── Type-2 paths ──
+
+        # Path 5: Y_2 × f_s → f_t2
+        if in_scalar_channels > 0 and out_type2_channels > 0:
+            self.w_st2 = nn.Linear(in_scalar_channels, out_type2_channels, bias=False)
+            self._num_paths += 1
+        else:
+            self.w_st2 = None
+
+        # Path 6: Y_0 × f_t2 → f_t2
+        if in_type2_channels > 0 and out_type2_channels > 0:
+            self.w_t2t2 = nn.Linear(in_type2_channels, out_type2_channels, bias=False)
+            self._num_paths += 1
+        else:
+            self.w_t2t2 = None
+
+        # Path 7: dir ⊗ f_v → f_t2 (CG l=1⊗l=1→l=2)
+        if in_vector_channels > 0 and out_type2_channels > 0:
+            self.w_vt2 = nn.Linear(in_vector_channels, out_type2_channels, bias=False)
+            self._num_paths += 1
+            # Register CG matrix as buffer (constant, not learnable)
+            self.register_buffer('cg_11_2', get_cg_matrix(1, 1, 2))
+        else:
+            self.w_vt2 = None
+            self.register_buffer('cg_11_2', None)
+
+        # Path 8: ||f_t2||² → f_s (invariant contraction)
+        if in_type2_channels > 0 and out_scalar_channels > 0:
+            self.w_t2s = nn.Linear(in_type2_channels, out_scalar_channels, bias=False)
+            self._num_paths += 1
+        else:
+            self.w_t2s = None
+
+        # Radial basis
         self.radial_basis = RadialBasis(
             num_basis=num_radial_basis,
             cutoff=radius,
@@ -347,7 +415,7 @@ class SE3Conv(nn.Module):
             num_output=max(self._num_paths, 1),
         )
 
-        # Output bias (scalars only; vectors have no bias for equivariance)
+        # Output bias (scalars only)
         if out_scalar_channels > 0:
             self.scalar_bias = nn.Parameter(torch.zeros(out_scalar_channels))
         else:
@@ -359,81 +427,62 @@ class SE3Conv(nn.Module):
         vectors: Tensor,
         graph: 'SpatialGraph',
         mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
-        """SE(3)-equivariant convolution — pure stateless operator.
-
-        Topology is provided by the caller via ``graph``.
-        This enables edge reuse across layers, CSR caching for
-        deterministic segment reduce, and SH caching.
-
-        The inner message computation is factored into
-        ``_compute_messages`` — a pure function of per-edge tensors
-        with fixed shapes, suitable for ``torch.compile`` fusion
-        by the caller (SE3Net or user code).
+        type2: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Tensor]:
+        """SE(3)-equivariant convolution.
 
         Args:
-            scalars: Scalar features
-                shape: [N, C_s_in]
-            vectors: Vector features
-                shape: [N, C_v_in, 3]
-                representation: SO(3) type-1 Cartesian vectors
-            graph: Pre-built SpatialGraph containing edges, directions,
-                SH coefficients, and CSR structure.
-            mask: Boolean mask for valid (non-pad) points
-                shape: [N], dtype: bool, optional
+            scalars: [N, C_s_in]
+            vectors: [N, C_v_in, 3], representation: SO(3) type-1
+            graph: Pre-built SpatialGraph
+            mask: [N] bool, optional
+            type2: [N, C_t2_in, 5], representation: SO(3) type-2, optional
 
         Returns:
-            Tuple of (scalar_out, vector_out):
-                scalar_out: [N, C_s_out]
-                vector_out: [N, C_v_out, 3]
+            If type2 is None: (scalar_out, vector_out)
+            If type2 is given: (scalar_out, vector_out, type2_out)
         """
         N = graph.N
         device = scalars.device
         input_dtype = scalars.dtype
+        has_type2 = type2 is not None and self.out_type2_channels > 0
 
         if graph.E == 0:
-            # Keep autograd graph alive: inputs contribute zero, but grad flows
             s_out = scalars.new_zeros(N, self.out_scalar_channels)
             v_out = vectors.new_zeros(N, self.out_vector_channels, 3)
-            # Connect input to graph: s_in * 0 so grad passes through
             s_out = s_out + (scalars.sum() * 0).unsqueeze(0)
             v_out = v_out + (vectors.sum() * 0).unsqueeze(0).unsqueeze(0)
             if self.scalar_bias is not None:
                 s_out = s_out + self.scalar_bias
+            if has_type2:
+                t2_out = scalars.new_zeros(N, self.out_type2_channels, 5)
+                return s_out, v_out, t2_out
             return s_out, v_out
 
-        # ── AMP GUARD ──────────────────────────────────────────────
-        # Disable autocast for the ENTIRE convolution body.
-        #
-        # Why: autocast silently demotes nn.Linear and @ (matmul) to
-        # FP16, including RadialBasis.mlp and the tensor-product
-        # matmuls in _compute_messages (s_src @ w_ss.t() etc.).
-        # In the backward pass these FP16 matmul gradients, when
-        # multiplied by GradScaler's scale factor, overflow FP16 max
-        # (65504) → Inf → GradScaler halves scale every epoch,
-        # eventually reaching scale=1 and causing gradient underflow.
-        #
-        # By disabling autocast here, ALL operations (radial MLP,
-        # tensor products, segment reduce) run in genuine FP32,
-        # both forward AND backward.  This is correct: geometric
-        # tensor products require FP32 precision (Rule 4).
-        # ──────────────────────────────────────────────────────────
         device_type = 'cuda' if device.type == 'cuda' else 'cpu'
         with autocast(device_type, enabled=False):
-            # Upcast half → FP32; preserve FP64 for equivariance tests
             compute_dtype = torch.float32 if scalars.dtype in (torch.float16, torch.bfloat16) else scalars.dtype
             scalars_f = scalars.to(compute_dtype)
             vectors_f = vectors.to(compute_dtype)
 
             # ── 1. Gather source features ──
-            s_src = scalars_f[graph.row]       # [E, C_s_in]
-            v_src = vectors_f[graph.row]       # [E, C_v_in, 3]
+            s_src = scalars_f[graph.row]
+            v_src = vectors_f[graph.row]
 
-            # ── 2. Compute radial weights (MLP runs in ≥FP32) ──
-            R = self.radial_basis(graph.dist.to(compute_dtype))  # [E, P]
+            # Type-2 gather
+            t2_src = None
+            if type2 is not None and self.in_type2_channels > 0:
+                t2_src = type2.to(compute_dtype)[graph.row]
 
-            # ── 3. Compute messages (all matmuls in genuine FP32) ──
-            total_scalar_msg, total_vector_msg = _compute_messages(
+            # ── 2. Compute radial weights ──
+            R = self.radial_basis(graph.dist.to(compute_dtype))
+
+            # ── 3. Compute messages ──
+            Y_2_data = None
+            if self.out_type2_channels > 0 and graph.Y.shape[-1] >= 9:
+                Y_2_data = graph.Y[..., 4:9]  # l=2 SH: channels 4-8
+
+            total_scalar_msg, total_vector_msg, total_type2_msg = _compute_messages(
                 s_src, v_src,
                 graph.direction.to(compute_dtype), graph.Y[..., 0:1].to(compute_dtype), R,
                 self.w_ss.weight if self.w_ss is not None else None,
@@ -443,38 +492,58 @@ class SE3Conv(nn.Module):
                 self.w_vv_cross.weight if self.w_vv_cross is not None else None,
                 self.out_scalar_channels,
                 self.out_vector_channels,
+                # Type-2 args
+                t2_src=t2_src,
+                Y_2=Y_2_data,
+                w_st2=self.w_st2.weight if self.w_st2 is not None else None,
+                w_t2t2=self.w_t2t2.weight if self.w_t2t2 is not None else None,
+                w_vt2=self.w_vt2.weight if self.w_vt2 is not None else None,
+                w_t2s=self.w_t2s.weight if self.w_t2s is not None else None,
+                cg_11_2=self.cg_11_2,
+                Ct2_out=self.out_type2_channels,
             )
 
-            # ── 4. Aggregate: deterministic segment reduce ──
+            # ── 4. Aggregate ──
             E = graph.E
             s_out = segment_reduce(
                 total_scalar_msg,
                 graph.col_sorted, graph.perm,
-                graph.node_start, graph.node_end,
-                N,
+                graph.node_start, graph.node_end, N,
             )
 
-            # Vectors: [E, Cv, 3] → [E, Cv*3], reduce, reshape back
-            v_msg_flat = total_vector_msg.reshape(E, -1)  # [E, Cv*3]
+            v_msg_flat = total_vector_msg.reshape(E, -1)
             v_out_flat = segment_reduce(
                 v_msg_flat,
                 graph.col_sorted, graph.perm,
-                graph.node_start, graph.node_end,
-                N,
+                graph.node_start, graph.node_end, N,
             )
             v_out = v_out_flat.reshape(N, self.out_vector_channels, 3)
 
-            # 5. Add scalar bias
+            # Type-2 aggregation
+            t2_out = None
+            if total_type2_msg is not None:
+                t2_msg_flat = total_type2_msg.reshape(E, -1)
+                t2_out_flat = segment_reduce(
+                    t2_msg_flat,
+                    graph.col_sorted, graph.perm,
+                    graph.node_start, graph.node_end, N,
+                )
+                t2_out = t2_out_flat.reshape(N, self.out_type2_channels, 5)
+
+            # 5. Scalar bias
             if self.scalar_bias is not None:
                 s_out = s_out + self.scalar_bias
 
-            # 6. Zero out pad point features (algebraic mask enforcement)
+            # 6. Mask
             if mask is not None:
-                pad_mask = (~mask).unsqueeze(-1)  # [N, 1]
+                pad_mask = (~mask).unsqueeze(-1)
                 s_out = s_out.masked_fill(pad_mask, 0.0)
                 v_out = v_out.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+                if t2_out is not None:
+                    t2_out = t2_out.masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
-        # Cast output back to input dtype for downstream autocast layers
+        if has_type2 and t2_out is not None:
+            return s_out.to(input_dtype), v_out.to(input_dtype), t2_out.to(input_dtype)
         return s_out.to(input_dtype), v_out.to(input_dtype)
 
     def forward_legacy(
@@ -486,23 +555,7 @@ class SE3Conv(nn.Module):
         mask: Optional[Tensor] = None,
         edge_index: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, Tensor]:
-        """Legacy forward: auto-builds SpatialGraph from pos.
-
-        Maintained for backward compatibility with existing code.
-        For new code, prefer building SpatialGraph explicitly and
-        calling ``forward(scalars, vectors, graph)``.
-
-        Args:
-            pos: [N, 3] point positions
-            scalars: [N, C_s_in]
-            vectors: [N, C_v_in, 3], representation: SO(3) type-1
-            batch: [N] optional batch assignment
-            mask: [N] bool optional
-            edge_index: (row, col) optional pre-computed edges
-
-        Returns:
-            (scalar_out, vector_out)
-        """
+        """Legacy forward: auto-builds SpatialGraph from pos."""
         from geoembodied.nn.modules.spatial_graph import SpatialGraph
 
         if edge_index is not None:
@@ -514,12 +567,12 @@ class SE3Conv(nn.Module):
                 max_num_neighbors=self.max_num_neighbors,
                 batch=batch, mask=mask,
             )
-
         return self.forward(scalars, vectors, graph, mask=mask)
 
     def extra_repr(self) -> str:
         return (
             f"scalar: {self.in_scalar_channels}→{self.out_scalar_channels}, "
             f"vector: {self.in_vector_channels}→{self.out_vector_channels}, "
+            f"type2: {self.in_type2_channels}→{self.out_type2_channels}, "
             f"radius={self.radius}, paths={self._num_paths}"
         )

@@ -5,35 +5,20 @@
 
 Single interaction layer: Conv → Norm → Gate → [SelfTP] → Scaled Residual.
 
-Post-Norm is REQUIRED for equivariant GNNs (NequIP/MACE/Allegro standard):
-    Gate mechanism uses sigmoid(Linear(scalars)) to control vectors.
-    The gate needs normalized scalar input to produce meaningful gates.
-    Pre-Norm leaves conv output unnormalized → gate sees random-scale
-    input → sigmoid ≈ 0.5 → vectors halved every layer → signal collapse.
+Supports scalar (l=0), vector (l=1), and type-2 (l=2) features.
 
-Residual scaling by 1/√2 prevents linear norm growth:
-    Without scaling: ||v_L|| ≈ ||v_0|| + L·c  (linear explosion)
-    With 1/√2 scaling: fixed point v* = c/(√2-1) ≈ 2.41c (bounded)
-
-The residual connection is algebraically safe for equivariance:
-    R(v₁ + v₂) = Rv₁ + Rv₂
+Post-Norm is REQUIRED for equivariant GNNs (NequIP/MACE/Allegro standard).
+Residual scaling by 1/√2 prevents linear norm growth.
 
 Self-Interaction TP (optional, use_self_tp=True):
-    Computes v·v → scalar (SO(3)-invariant dot product) and mixes
-    the result into the scalar feature stream. This raises the effective
-    body order from ν=1 to ν=2 (MACE-style) without requiring
-    Clebsch-Gordan tensor products.
-
-    Equivariance proof: (Rv)·(Rv) = v^T R^T R v = v·v  (invariant)
-
-All internal components (SE3Conv, EquivariantLayerNorm,
-GatedNonlinearity) maintain SO(3)/SE(3) equivariance by construction.
+    - v·v → scalar (ν=2 body order)
+    - t2·t2 → scalar (||t2_c||² invariant contraction)
 """
 
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -52,47 +37,31 @@ class SE3NetBlock(nn.Module):
 
     Architecture::
 
-        (s, v) ──→ SE3Conv ──→ EquivariantLayerNorm ──→ GatedNonlinearity
+        (s, v, [t2]) → SE3Conv → EquivariantLayerNorm → GatedNonlinearity
                                                                │
-                                                    [+ SelfTP: v·v → s]
+                                                    [+ SelfTP: v·v, t2·t2 → s]
                                                                │
                                                      [+ skip] × 1/√2
                                                                │
-                                                          (s_out, v_out)
-
-    Post-Norm ensures the gate sees normalized input, which is critical
-    for the sigmoid gate to produce meaningful (non-0.5) gate values.
-
-    Residual scaling by 1/√2 prevents vector norm O(L) growth while
-    preserving gradient flow through the identity path.
-
-    Self-Interaction TP (v·v → scalar) raises effective body order
-    from ν=1 to ν=2 by injecting invariant quadratic information
-    from the vector stream into the scalar stream.
+                                                          (s_out, v_out, [t2_out])
 
     Args:
         channels_scalar: Scalar feature channels (in = out)
-            type: int
         channels_vector: Vector feature channels (in = out)
-            type: int
+        channels_type2: Type-2 feature channels (in = out), 0 to disable
         radius: Spatial graph radius for SE3Conv
-            type: float
-        max_num_neighbors: Max edges per node for SE3Conv
-            type: int
+        max_num_neighbors: Max edges per node
         use_residual: Enable skip connection
-            type: bool, default True
-        gate_mode: Gate mode for GatedNonlinearity
-            type: str, default 'scalar'
-            options: 'scalar' (standard), 'norm' (norm-aware)
+        gate_mode: Gate mode ('scalar' or 'norm')
         use_self_tp: Enable self-interaction tensor product
-            type: bool, default False
     """
 
     def __init__(
         self,
         channels_scalar: int,
         channels_vector: int,
-        radius: float,
+        channels_type2: int = 0,
+        radius: float = 1.0,
         max_num_neighbors: int = 32,
         use_residual: bool = True,
         gate_mode: str = 'scalar',
@@ -101,12 +70,10 @@ class SE3NetBlock(nn.Module):
         super().__init__()
         self.channels_scalar = channels_scalar
         self.channels_vector = channels_vector
+        self.channels_type2 = channels_type2
         self.use_residual = use_residual
         self.use_self_tp = use_self_tp
 
-        # Residual scaling: 1/√2 prevents linear norm growth
-        # through residual accumulation across L layers.
-        # Fixed point: v* = c/(√2-1) ≈ 2.41c (bounded)
         self._rsqrt2 = 1.0 / math.sqrt(2.0)
 
         self.conv = SE3Conv(
@@ -114,28 +81,34 @@ class SE3NetBlock(nn.Module):
             in_vector_channels=channels_vector,
             out_scalar_channels=channels_scalar,
             out_vector_channels=channels_vector,
+            in_type2_channels=channels_type2,
+            out_type2_channels=channels_type2,
             radius=radius,
             max_num_neighbors=max_num_neighbors,
         )
-        # Post-Norm: normalize AFTER conv, BEFORE gate
-        # Gate requires normalized input for sigmoid to produce
-        # discriminative values (not degenerate 0.5)
+
         self.norm = EquivariantLayerNorm(
             num_scalars=channels_scalar,
             num_vectors=channels_vector,
+            num_type2=channels_type2,
         )
+
         self.gate = GatedNonlinearity(
             num_scalars=channels_scalar,
             num_vectors=channels_vector,
+            num_type2=channels_type2,
             gate_mode=gate_mode,
         )
 
-        # Self-Interaction TP: v·v → scalar (body order ν=1 → ν=2)
-        # v·v: [N, C_v] (||v_c||²), SO(3)-invariant
-        # Projects into scalar stream: [N, C_v] → [N, C_s]
+        # Self-Interaction TP: v·v + t2·t2 → scalar
+        self_tp_input_dim = 0
         if use_self_tp and channels_vector > 0:
-            self.self_tp_proj = nn.Linear(channels_vector, channels_scalar, bias=False)
-            # Scale factor to prevent magnitude explosion when adding to scalar stream
+            self_tp_input_dim += channels_vector
+        if use_self_tp and channels_type2 > 0:
+            self_tp_input_dim += channels_type2
+
+        if self_tp_input_dim > 0:
+            self.self_tp_proj = nn.Linear(self_tp_input_dim, channels_scalar, bias=False)
             self.self_tp_scale = nn.Parameter(torch.tensor(0.1))
         else:
             self.self_tp_proj = None
@@ -144,45 +117,72 @@ class SE3NetBlock(nn.Module):
         self,
         scalars: Tensor,
         vectors: Tensor,
-        graph: SpatialGraph,
-    ) -> tuple[Tensor, Tensor]:
+        graph: 'SpatialGraph',
+        type2: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
         """Forward pass: Conv → Norm → Gate → [SelfTP] → Scaled Residual.
 
         Args:
-            scalars: Scalar features
-                shape: [N, channels_scalar], representation: SO(3) type-0
-            vectors: Vector features
-                shape: [N, channels_vector, 3], representation: SO(3) type-1
-            graph: Pre-built spatial graph (shared across layers)
+            scalars: [N, channels_scalar], representation: SO(3) type-0
+            vectors: [N, channels_vector, 3], representation: SO(3) type-1
+            graph: Pre-built spatial graph
+            type2: [N, channels_type2, 5], representation: SO(3) type-2, optional
 
         Returns:
-            (scalars_out, vectors_out) with same shapes as input
+            If type2 is None: (scalars_out, vectors_out)
+            If type2 is given: (scalars_out, vectors_out, type2_out)
         """
-        s_new, v_new = self.conv(scalars, vectors, graph)
-        s_new, v_new = self.norm(s_new, v_new)
-        s_new, v_new = self.gate(s_new, v_new)
+        has_type2 = type2 is not None and self.channels_type2 > 0
 
-        # Self-Interaction TP: v·v → scalar injection
+        # Conv
+        if has_type2:
+            s_new, v_new, t2_new = self.conv(scalars, vectors, graph, type2=type2)
+        else:
+            s_new, v_new = self.conv(scalars, vectors, graph)
+            t2_new = None
+
+        # Norm
+        if t2_new is not None:
+            s_new, v_new, t2_new = self.norm(s_new, v_new, t2_new)
+        else:
+            s_new, v_new = self.norm(s_new, v_new)
+
+        # Gate
+        if t2_new is not None:
+            s_new, v_new, t2_new = self.gate(s_new, v_new, t2_new)
+        else:
+            s_new, v_new = self.gate(s_new, v_new)
+
+        # Self-Interaction TP
         if self.self_tp_proj is not None:
-            # v·v per channel: [N, C_v, 3] → [N, C_v]
-            # This is ||v_c||² — perfectly SO(3)-invariant
-            v_dot_v = (v_new * v_new).sum(dim=-1)  # [N, C_v]
-            # Project into scalar stream with learnable scale
-            s_tp = self.self_tp_proj(v_dot_v) * self.self_tp_scale  # [N, C_s]
-            s_new = s_new + s_tp
+            tp_inputs = []
+            if self.channels_vector > 0:
+                v_dot_v = (v_new * v_new).sum(dim=-1)  # [N, C_v]
+                tp_inputs.append(v_dot_v)
+            if t2_new is not None and self.channels_type2 > 0:
+                t2_dot_t2 = (t2_new * t2_new).sum(dim=-1)  # [N, C_t2]
+                tp_inputs.append(t2_dot_t2)
+            if tp_inputs:
+                tp_cat = torch.cat(tp_inputs, dim=-1)  # [N, C_v + C_t2]
+                s_tp = self.self_tp_proj(tp_cat) * self.self_tp_scale
+                s_new = s_new + s_tp
 
+        # Residual
         if self.use_residual:
-            # Scaled residual: (conv_path + identity) / √2
-            # Prevents ||v|| from growing O(L) through residual accumulation
             s_new = (s_new + scalars) * self._rsqrt2
             v_new = (v_new + vectors) * self._rsqrt2
+            if t2_new is not None and type2 is not None:
+                t2_new = (t2_new + type2) * self._rsqrt2
 
+        if has_type2 and t2_new is not None:
+            return s_new, v_new, t2_new
         return s_new, v_new
 
     def extra_repr(self) -> str:
         return (
             f"scalar={self.channels_scalar}, "
             f"vector={self.channels_vector}, "
+            f"type2={self.channels_type2}, "
             f"residual={self.use_residual}, "
             f"gate_mode={self.gate.gate_mode}, "
             f"self_tp={self.use_self_tp}"

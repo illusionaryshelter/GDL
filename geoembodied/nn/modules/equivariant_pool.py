@@ -23,6 +23,12 @@ Usage:
     seed_pos, s_out, v_out, ptr_out, fps_idx = pool(
         pos, scalars, vectors, ptr
     )
+    # With type-2:
+    pool_t2 = EquivariantPool(scalar_channels=64, vector_channels=16,
+                               type2_channels=4, ratio=0.25)
+    seed_pos, s_out, v_out, t2_out, ptr_out, fps_idx = pool_t2(
+        pos, scalars, vectors, ptr, type2=type2
+    )
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.amp import autocast
-from typing import Tuple
+from typing import Optional, Tuple
 
 # FPS dispatch now goes through geoembodied.csrc (CUDA kernel or fallback)
 from geoembodied.functional.knn import knn
@@ -55,6 +61,7 @@ class EquivariantPool(nn.Module):
         self,
         scalar_channels: int,
         vector_channels: int,
+        type2_channels: int = 0,
         ratio: float = 0.25,
         k_neighbors: int = 16,
         attn_hidden: int = 16,
@@ -62,6 +69,7 @@ class EquivariantPool(nn.Module):
         super().__init__()
         self.scalar_channels = scalar_channels
         self.vector_channels = vector_channels
+        self.type2_channels = type2_channels
         self.ratio = ratio
         self.k_neighbors = k_neighbors
 
@@ -69,7 +77,7 @@ class EquivariantPool(nn.Module):
         # Attention from SO(3)-invariant features
         # ═══════════════════════════════════════════════════════════════
         #
-        # 7 invariant features, all well-conditioned:
+        # Base 7 invariant features (l=0, l=1):
         #   0. dist              — Euclidean distance (≥0)
         #   1. scalar_ratio      — ‖s_nbr‖ / ‖s_seed‖ (relative, ~1.0)
         #   2. cos(v_seed, v_nbr) — cosine similarity, [-1, 1]
@@ -77,10 +85,12 @@ class EquivariantPool(nn.Module):
         #   4. cos(d̂_ij,  v_seed)— direction-seed alignment, [-1, 1]
         #   5. ‖v_nbr‖          — neighbor vector magnitude
         #   6. ‖v_seed‖         — seed vector magnitude
+        # +1 if type-2 enabled:
+        #   7. ‖t2_nbr‖_mean    — neighbor type-2 norm (SO(3)-invariant)
         #
         # Per-feature BatchNorm ensures each feature has ~N(0,1) scale
         # regardless of its physical units, preventing scale mismatch.
-        n_inv_features = 7
+        n_inv_features = 7 + (1 if type2_channels > 0 else 0)
         self.attn_feat_norm = nn.BatchNorm1d(n_inv_features)
 
         self.attn_mlp = nn.Sequential(
@@ -101,7 +111,8 @@ class EquivariantPool(nn.Module):
         scalars: Tensor,
         vectors: Tensor,
         ptr: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        type2: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, ...]:
         """Downsample point cloud with equivariant feature aggregation.
 
         Args:
@@ -113,16 +124,10 @@ class EquivariantPool(nn.Module):
                 shape: [N_total, C_v, 3], representation: SO(3) type-1
             ptr: CSR batch offsets
                 shape: [B+1], int64
+            type2: Optional type-2 features
+                shape: [N_total, C_t2, 5]
 
         Returns:
-            seed_pos: Downsampled positions
-                shape: [N_out, 3]
-            s_out: Pooled scalar features
-                shape: [N_out, C_s]
-            v_out: Pooled vector features
-                shape: [N_out, C_v, 3], representation: SO(3) type-1
-            ptr_out: New CSR offsets
-                shape: [B+1], int64
             fps_idx: FPS selected indices (global, into original)
                 shape: [N_out], int64
         """
@@ -224,8 +229,8 @@ class EquivariantPool(nn.Module):
             nbr_v_norm_mean = nbr_v_norms.mean(dim=-1)             # [N_out, K]
             seed_v_norm_mean = seed_v_norms.mean(dim=-1, keepdim=True).expand(-1, K)
 
-            # Stack 7 well-conditioned invariant features: [N_out, K, 7]
-            attn_input = torch.stack([
+            # Stack invariant features: [N_out, K, 7 or 8]
+            feat_list = [
                 dist,              # ≥0, physical scale
                 scalar_ratio,      # ~1.0, relative
                 cos_vi_vj_mean,    # [-1, 1], angular
@@ -233,7 +238,17 @@ class EquivariantPool(nn.Module):
                 cos_d_vi_mean,     # [-1, 1], angular
                 nbr_v_norm_mean,   # ≥0, magnitude
                 seed_v_norm_mean,  # ≥0, magnitude
-            ], dim=-1)
+            ]
+
+            # Type-2 invariant feature
+            if type2 is not None and self.type2_channels > 0:
+                type2_f = type2.to(compute_dtype)
+                nbr_t2 = type2_f[safe_idx]  # [N_out, K, C_t2, 5]
+                # ||t2||: invariant per-channel norm, averaged
+                nbr_t2_norm_mean = nbr_t2.pow(2).sum(dim=-1).sqrt().mean(dim=-1)  # [N_out, K]
+                feat_list.append(nbr_t2_norm_mean)
+
+            attn_input = torch.stack(feat_list, dim=-1)
 
             # Per-feature BatchNorm: [N_out, K, 7] → [N_out*K, 7] → normalize → reshape
             NK = N_out * K
@@ -276,12 +291,23 @@ class EquivariantPool(nn.Module):
             nbr_vectors = vectors[safe_idx]  # [N_out, K, C_v, 3]
             v_out = (w.unsqueeze(-1).unsqueeze(-1) * nbr_vectors).sum(dim=1)
 
+            # Type-2 aggregation: [N_out, K, C_t2, 5] weighted sum → [N_out, C_t2, 5]
+            t2_out = None
+            if type2 is not None and self.type2_channels > 0:
+                type2_f = type2.to(compute_dtype)
+                nbr_t2_all = type2_f[safe_idx]  # [N_out, K, C_t2, 5]
+                t2_out = (w.unsqueeze(-1).unsqueeze(-1) * nbr_t2_all).sum(dim=1)
+
             # Zero out features from invalid neighbors
             all_invalid = ~valid_mask.any(dim=1)  # [N_out]
             if all_invalid.any():
                 s_out[all_invalid] = 0.0
                 v_out[all_invalid] = 0.0
+                if t2_out is not None:
+                    t2_out[all_invalid] = 0.0
 
+        if t2_out is not None:
+            return seed_pos, s_out.to(input_dtype), v_out.to(input_dtype), t2_out.to(input_dtype), ptr_out, fps_idx
         return seed_pos, s_out.to(input_dtype), v_out.to(input_dtype), ptr_out, fps_idx
 
     def extra_repr(self) -> str:

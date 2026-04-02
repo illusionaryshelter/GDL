@@ -343,6 +343,8 @@ def main() -> None:
                         help='Enable bottleneck geometric attention')
     parser.add_argument('--no_bottleneck_attn', action='store_true',
                         help='Disable bottleneck geometric attention')
+    parser.add_argument('--hidden_type2', type=int, default=0,
+                        help='Type-2 (l=2) channels. 0=disabled, 4=recommended')
     args = parser.parse_args()
     if args.no_self_tp:
         args.use_self_tp = False
@@ -364,6 +366,7 @@ def main() -> None:
     print(f"Gate mode: {args.gate_mode}")
     print(f"Self-TP: {'ON (ν=2)' if args.use_self_tp else 'OFF (ν=1)'}")
     print(f"Bottleneck attn: {'ON' if args.use_bottleneck_attn else 'OFF'}")
+    print(f"Type-2 (l=2):  {args.hidden_type2} channels {'(disabled)' if args.hidden_type2 == 0 else ''}")
     print(f"Batch: {args.batch_size} × {args.accum_steps} accum = "
           f"{args.batch_size * args.accum_steps} effective")
     print()
@@ -405,6 +408,7 @@ def main() -> None:
         in_channels=1,
         hidden_scalar=args.hidden_scalar,
         hidden_vector=args.hidden_vector,
+        hidden_type2=args.hidden_type2,
         num_stages=args.num_stages,
         layers_per_stage=args.layers_per_stage,
         pool_ratio=args.pool_ratio,
@@ -495,6 +499,12 @@ def main() -> None:
                 enc_norms.append(f"s{i}={diag[key]:.3f}")
         if enc_norms:
             diag_log += f" | enc:[{','.join(enc_norms)}]"
+
+        # Type-2 norm diagnostics
+        t2_norm = diag.get('t2_norm_mean', None)
+        if t2_norm is not None:
+            t2_std = diag.get('t2_norm_std', 0)
+            diag_log += f" | t2={t2_norm:.4f}±{t2_std:.4f}"
 
         if scaler_scale > 0:
             diag_log += f" | amp_scale={scaler_scale:.0f}"

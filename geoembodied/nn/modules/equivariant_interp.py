@@ -23,6 +23,12 @@ Usage:
         dense_pos, coarse_pos, s_coarse, v_coarse,
         ptr_dense, ptr_coarse, s_skip=s_enc, v_skip=v_enc
     )
+    # With type-2:
+    s_dense, v_dense, t2_dense = interp(
+        dense_pos, coarse_pos, s_coarse, v_coarse,
+        ptr_dense, ptr_coarse, s_skip=s_enc, v_skip=v_enc,
+        t2_coarse=t2_c, t2_skip=t2_s
+    )
 """
 
 from __future__ import annotations
@@ -40,7 +46,7 @@ class EquivariantInterpolate(nn.Module):
 
     No learnable parameters — purely geometric interpolation.
     Equivariance is guaranteed: IDW weights depend only on distances
-    (SO(3)-invariant), and weighted-sum preserves vector transformation.
+    (SO(3)-invariant), and weighted-sum preserves transformation for any l.
 
     Args:
         k_neighbors: Number of nearest neighbors for interpolation (typically 3)
@@ -60,78 +66,75 @@ class EquivariantInterpolate(nn.Module):
         ptr_coarse: Tensor,
         s_skip: Optional[Tensor] = None,
         v_skip: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        t2_coarse: Optional[Tensor] = None,
+        t2_skip: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, ...]:
         """Interpolate features from coarse to dense resolution.
 
         Args:
-            dense_pos: Dense (target) point positions
-                shape: [N_dense, 3]
-            coarse_pos: Coarse (source) point positions
-                shape: [N_coarse, 3]
-            s_coarse: Coarse scalar features
-                shape: [N_coarse, C_s]
-            v_coarse: Coarse vector features
-                shape: [N_coarse, C_v, 3], representation: SO(3) type-1
-            ptr_dense: CSR offsets for dense batch
-                shape: [B+1], int64
-            ptr_coarse: CSR offsets for coarse batch
-                shape: [B+1], int64
-            s_skip: Optional skip-connection scalar features (from encoder)
-                shape: [N_dense, C_s_skip]
-            v_skip: Optional skip-connection vector features (from encoder)
-                shape: [N_dense, C_v_skip, 3], representation: SO(3) type-1
+            dense_pos: [N_dense, 3]
+            coarse_pos: [N_coarse, 3]
+            s_coarse: [N_coarse, C_s]
+            v_coarse: [N_coarse, C_v, 3], representation: SO(3) type-1
+            ptr_dense: [B+1], int64
+            ptr_coarse: [B+1], int64
+            s_skip: Optional [N_dense, C_s_skip]
+            v_skip: Optional [N_dense, C_v_skip, 3], representation: SO(3) type-1
+            t2_coarse: Optional [N_coarse, C_t2, 5], representation: SO(3) type-2
+            t2_skip: Optional [N_dense, C_t2_skip, 5], representation: SO(3) type-2
 
         Returns:
-            s_out: Interpolated (+ skip) scalar features
-                shape: [N_dense, C_s] or [N_dense, C_s + C_s_skip]
-            v_out: Interpolated (+ skip) vector features
-                shape: [N_dense, C_v, 3] or [N_dense, C_v + C_v_skip, 3]
+            Without type-2: (s_out, v_out)
+            With type-2: (s_out, v_out, t2_out)
         """
-        # ── 1. KNN: find nearest coarse neighbors for each dense point ──
+        # ── 1. KNN ──
         knn_idx, knn_dists = knn(
             dense_pos, coarse_pos, ptr_dense, ptr_coarse, self.k_neighbors
-        )  # [N_dense, K], [N_dense, K]
+        )
 
-        # ── 2. Compute inverse-distance weights ──
-        valid_mask = knn_idx >= 0  # [N_dense, K]
-
-        # Inverse distance with robust clamp (Rule 4)
-        # knn_dists = squared distances.  When d² < 1e-4 (d < 0.01),
-        # the point is nearly co-located — FP32 distance noise (~4e-6)
-        # would cause huge weight oscillation through 1/d. Clamping d²
-        # at 1e-4 bounds relative weight error to < 0.01%.
-        inv_dist = 1.0 / knn_dists.clamp(min=1e-4).sqrt()  # [N_dense, K]
-
-        # Mask invalid neighbors
+        # ── 2. IDW weights ──
+        valid_mask = knn_idx >= 0
+        inv_dist = 1.0 / knn_dists.clamp(min=1e-4).sqrt()
         inv_dist = inv_dist.masked_fill(~valid_mask, 0.0)
-
-        # Normalize weights per query point
         weight_sum = inv_dist.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        weights = inv_dist / weight_sum  # [N_dense, K]
+        weights = inv_dist / weight_sum
 
         # ── 3. Gather and aggregate ──
         safe_idx = knn_idx.clamp(min=0)
 
-        # Scalar interpolation: [N_dense, K, C_s] → [N_dense, C_s]
+        # Scalar interpolation
         nbr_scalars = s_coarse[safe_idx]
         s_interp = (weights.unsqueeze(-1) * nbr_scalars).sum(dim=1)
 
-        # Vector interpolation: [N_dense, K, C_v, 3] → [N_dense, C_v, 3]
+        # Vector interpolation
         nbr_vectors = v_coarse[safe_idx]
         v_interp = (weights.unsqueeze(-1).unsqueeze(-1) * nbr_vectors).sum(dim=1)
 
-        # Handle fully invalid rows (should not happen if data is correct)
+        # Type-2 interpolation
+        t2_interp = None
+        if t2_coarse is not None:
+            nbr_t2 = t2_coarse[safe_idx]
+            t2_interp = (weights.unsqueeze(-1).unsqueeze(-1) * nbr_t2).sum(dim=1)
+
+        # Handle invalid rows
         all_invalid = ~valid_mask.any(dim=1)
         if all_invalid.any():
             s_interp[all_invalid] = 0.0
             v_interp[all_invalid] = 0.0
+            if t2_interp is not None:
+                t2_interp[all_invalid] = 0.0
 
-        # ── 4. Skip connection (concatenate) ──
+        # ── 4. Skip connections (concatenate) ──
         if s_skip is not None:
-            s_interp = torch.cat([s_interp, s_skip], dim=-1)  # [N_dense, C_s + C_s_skip]
+            s_interp = torch.cat([s_interp, s_skip], dim=-1)
 
         if v_skip is not None:
-            v_interp = torch.cat([v_interp, v_skip], dim=1)  # [N_dense, C_v + C_v_skip, 3]
+            v_interp = torch.cat([v_interp, v_skip], dim=1)
+
+        if t2_interp is not None:
+            if t2_skip is not None:
+                t2_interp = torch.cat([t2_interp, t2_skip], dim=1)
+            return s_interp, v_interp, t2_interp
 
         return s_interp, v_interp
 
