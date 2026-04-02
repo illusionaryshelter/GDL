@@ -66,7 +66,7 @@ def test_se3conv_internal_dtype():
     w_sv = torch.randn(C_v, C_s, device=device, dtype=torch.float32)
     
     # Without autocast
-    s1, v1 = _compute_messages(
+    s1, v1, _ = _compute_messages(
         s_src, v_src, direction, Y_0, R,
         w_ss, w_sv, None, None, None, C_s, C_v,
     )
@@ -75,13 +75,12 @@ def test_se3conv_internal_dtype():
     
     # With autocast — THIS IS WHAT HAPPENS DURING TRAINING
     with autocast('cuda', enabled=True):
-        s2, v2 = _compute_messages(
+        s2, v2, _ = _compute_messages(
             s_src, v_src, direction, Y_0, R,
             w_ss, w_sv, None, None, None, C_s, C_v,
         )
         print(f"With autocast: s_out.dtype={s2.dtype}, v_out.dtype={v2.dtype}")
         print(f"  s_out range: [{s2.min():.2f}, {s2.max():.2f}]")
-        
         # FP16 range check
         if s2.dtype == torch.float16:
             print(f"  ⚠ OUTPUT IS FP16! Max FP16 = 65504")
