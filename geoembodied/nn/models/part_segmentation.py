@@ -10,6 +10,11 @@ are passed as constructor arguments — no hardcoded dataset knowledge.
 Architecture::
 
     pos, normals → MultiScaleSE3Net (U-Net) → s_out [N, C_s]
+                                               v_out [N, C_v, 3]
+                                               t2_out [N, C_t2, 5]
+                                              ↓
+    Invariant projection:  v_inv = proj(||v_c||)   ← SO(3)-invariant
+                          t2_inv = ||t2_c||²        ← SO(3)-invariant
                                               ↓
     cat_indices → one_hot [N, num_categories] ─┤
                                               ↓
@@ -18,7 +23,10 @@ Architecture::
                           category mask → masked logits [N, num_parts]
 
 Design principles:
-    - Head uses ONLY scalar features (SO(3)-invariant by construction)
+    - Head uses SO(3)-invariant features derived from ALL representation
+      types: scalars (l=0), vector norms (l=1 → l=0), type-2 norms (l=2 → l=0)
+    - This follows the MACE/Vector Neurons principle: invariant readout
+      from equivariant features via norm contraction.
     - Category one-hot injected at HEAD level only (backbone stays
       category-agnostic → can pretrain across datasets)
     - Category mask is MANDATORY (prevents impossible part predictions)
@@ -135,18 +143,40 @@ class SE3PartSegNet(nn.Module):
         if use_normals:
             self.normal_proj = nn.Linear(1, hidden_vector, bias=False)
 
-        # Classification head — invariant scalars only!
+        # ── Vector Invariant Projection ──
+        # Extract SO(3)-invariant information from vector (l=1) features.
+        #
+        # ||v_c|| = sqrt(v_c · v_c) is SO(3)-invariant per channel.
+        # This linear map learns which combinations of vector channel
+        # magnitudes are informative for part classification.
+        #
+        # Follows Vector Neurons (Deng et al., ICCV 2021) and MACE
+        # readout principles: invariant contractions from equivariant reps.
+        v_inv_dim = hidden_vector  # one norm per vector channel
+        self.v_inv_proj = nn.Linear(v_inv_dim, hidden_scalar // 2, bias=False)
+
+        # ── Classification Head ──
         # Input: local scalar [N, C_s]
-        #        + type-2 invariant [N, C_t2] (||t2_c||², SO(3)-invariant)
+        #        + vector invariant [N, C_s // 2] (projected ||v_c||)
+        #        + type-2 invariant [N, C_t2] (||t2_c||²)
         #        + multi-scale globals [N, num_stages * C_s]
         #        + category one-hot [N, num_categories]
         # Output: logits [N, num_parts]
-        head_in = hidden_scalar + hidden_type2 + hidden_scalar * num_stages + num_categories
+        head_in = (
+            hidden_scalar           # s_out
+            + hidden_scalar // 2    # v_inv (projected vector norms)
+            + hidden_type2          # t2_inv (type-2 norms²)
+            + hidden_scalar * num_stages  # multi-scale globals
+            + num_categories        # category one-hot
+        )
+        self._head_in_dim = head_in  # for diagnostics
         self.head = nn.Sequential(
             nn.Linear(head_in, head_hidden),
+            nn.LayerNorm(head_hidden),
             nn.SiLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.15),
             nn.Linear(head_hidden, head_hidden),
+            nn.LayerNorm(head_hidden),
             nn.SiLU(),
             nn.Dropout(0.1),
             nn.Linear(head_hidden, num_parts),
@@ -281,9 +311,17 @@ class SE3PartSegNet(nn.Module):
             point_globals = [g[point_cat_batch] for g in global_feats]
             multi_scale = torch.cat(point_globals, dim=-1)
 
-            # ── 6. Type-2 invariant features ──
-            # ||t2_c||² is SO(3)-invariant: sum_m t2[c,m]² for each channel c
+            # ── 6. Invariant feature extraction ──
+            # All features entering the head MUST be SO(3)-invariant.
             head_parts = [s_out]
+
+            # Vector invariant: ||v_c|| per channel → learned projection
+            # ||v_c|| = sqrt(sum_d v[c,d]²) is invariant under SO(3)
+            v_norms = v_out.norm(dim=-1)  # [N, C_v]
+            v_inv = self.v_inv_proj(v_norms)  # [N, C_s // 2]
+            head_parts.append(v_inv)
+
+            # Type-2 invariant: ||t2_c||² per channel
             if t2_out is not None and self.hidden_type2 > 0:
                 t2_inv = (t2_out * t2_out).sum(dim=-1)  # [N, C_t2]
                 head_parts.append(t2_inv)
@@ -348,9 +386,11 @@ class SE3PartSegNet(nn.Module):
             # ── Diagnostics ──
             diag: dict = {}
 
-            v_norms = v_out.norm(dim=-1).mean(dim=-1)
-            diag['v_norm_mean'] = v_norms.mean().item()
-            diag['v_norm_std'] = v_norms.std().item()
+            # Vector feature norms (per-channel, then per-point)
+            v_per_channel_norms = v_out.norm(dim=-1)  # [N, C_v]
+            v_per_point = v_per_channel_norms.mean(dim=-1)  # [N]
+            diag['v_norm_mean'] = v_per_point.mean().item()
+            diag['v_norm_std'] = v_per_point.std().item()
 
             for i, enc_s in enumerate(enc_s_list):
                 diag[f'enc{i}_s_norm'] = enc_s.norm(dim=-1).mean().item()
@@ -384,7 +424,21 @@ class SE3PartSegNet(nn.Module):
             point_globals = [g[point_cat_batch] for g in global_feats]
             multi_scale = torch.cat(point_globals, dim=-1)
 
+            # ── 6. Invariant feature extraction (same as forward) ──
             head_parts = [s_out]
+
+            # Vector invariant: ||v_c|| → learned projection
+            v_norms = v_per_channel_norms  # reuse from diagnostics
+            v_inv = self.v_inv_proj(v_norms)  # [N, C_s // 2]
+            head_parts.append(v_inv)
+
+            # Vector invariant diagnostics
+            diag['v_inv_norm'] = v_inv.norm(dim=-1).mean().item()
+            diag['v_inv_std'] = v_inv.std(dim=0).mean().item()
+            # v_utilization: ratio of v_inv contribution to head input
+            # Higher = vector features contributing more to predictions
+            diag['head_in_dim'] = self._head_in_dim
+
             if t2_out is not None and self.hidden_type2 > 0:
                 t2_inv = (t2_out * t2_out).sum(dim=-1)
                 head_parts.append(t2_inv)

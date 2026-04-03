@@ -355,6 +355,8 @@ def main() -> None:
                         help='Disable bottleneck geometric attention')
     parser.add_argument('--hidden_type2', type=int, default=0,
                         help='Type-2 (l=2) channels. 0=disabled, 4=recommended')
+    parser.add_argument('--head_hidden', type=int, default=128,
+                        help='Classification head hidden dim')
     parser.add_argument('--compile', action='store_true',
                         help='Enable torch.compile(dynamic=True) for kernel fusion')
     args = parser.parse_args()
@@ -431,6 +433,7 @@ def main() -> None:
         layers_per_stage=args.layers_per_stage,
         pool_ratio=args.pool_ratio,
         use_normals=use_normals,
+        head_hidden=args.head_hidden,
         gate_mode=args.gate_mode,
         use_self_tp=args.use_self_tp,
         use_bottleneck_attn=args.use_bottleneck_attn,
@@ -532,6 +535,12 @@ def main() -> None:
         if t2_norm is not None:
             t2_std = diag.get('t2_norm_std', 0)
             diag_log += f" | t2={t2_norm:.4f}±{t2_std:.4f}"
+
+        # Vector → head invariant diagnostics (Component 2)
+        v_inv_norm = diag.get('v_inv_norm', None)
+        if v_inv_norm is not None:
+            v_inv_std = diag.get('v_inv_std', 0)
+            diag_log += f" | v_inv={v_inv_norm:.4f}±{v_inv_std:.4f}"
 
         if scaler_scale > 0:
             diag_log += f" | amp_scale={scaler_scale:.0f}"
