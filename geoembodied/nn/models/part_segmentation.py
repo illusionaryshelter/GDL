@@ -457,6 +457,7 @@ class SE3PartSegNet(nn.Module):
         import math
         entropies = []
         maxes = []
+        temperatures = []
 
         for layer in self.backbone.pool_layers:
             if not hasattr(layer, '_last_attn_weights'):
@@ -472,12 +473,19 @@ class SE3PartSegNet(nn.Module):
             # Per-seed max weight
             maxes.append(w.max(dim=-1).values.mean().item())
 
+            # Learned temperature (< 1 = sharpening, > 1 = smoothing)
+            temp = layer.log_temperature.exp().item()
+            temperatures.append(temp)
+
         K = self.backbone.pool_layers[0].k_neighbors if self.backbone.pool_layers else 16
         max_ent = math.log(K)
 
-        return {
+        stats = {
             'attn_entropy_mean': sum(entropies) / max(len(entropies), 1),
             'attn_max_mean': sum(maxes) / max(len(maxes), 1),
             'attn_uniform_ratio': (sum(entropies) / max(len(entropies), 1)) / max_ent
                                   if max_ent > 0 else 1.0,
         }
+        if temperatures:
+            stats['pool_temperature'] = sum(temperatures) / len(temperatures)
+        return stats

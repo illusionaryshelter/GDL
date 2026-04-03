@@ -542,6 +542,11 @@ def main() -> None:
             v_inv_std = diag.get('v_inv_std', 0)
             diag_log += f" | v_inv={v_inv_norm:.4f}±{v_inv_std:.4f}"
 
+        # Pool attention temperature (Component 1)
+        pool_temp = diag.get('pool_temperature', None)
+        if pool_temp is not None:
+            diag_log += f" | pool_T={pool_temp:.3f}"
+
         if scaler_scale > 0:
             diag_log += f" | amp_scale={scaler_scale:.0f}"
 

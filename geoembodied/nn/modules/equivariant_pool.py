@@ -74,9 +74,37 @@ class EquivariantPool(nn.Module):
         self.k_neighbors = k_neighbors
 
         # ═══════════════════════════════════════════════════════════════
-        # Attention from SO(3)-invariant features
+        # Dynamic Content-Aware Attention (GATv2-style)
         # ═══════════════════════════════════════════════════════════════
         #
+        # Two-part attention score:
+        #   attn = content_score(seed_s, nbr_s) + geo_bias(invariants)
+        #
+        # Part 1 — Content attention (GATv2 pattern):
+        #   W_q projects seed scalars, W_k projects neighbor scalars,
+        #   then: score = a^T * SiLU(W_q * s_seed + W_k * s_nbr)
+        #   This is DYNAMIC: the ranking of neighbors depends on the
+        #   query (seed) node features, resolving the static attention
+        #   problem identified by Brody et al. (ICLR 2022).
+        #
+        # Part 2 — Geometric position bias:
+        #   Same 7-8 invariant features as before, but now as additive
+        #   bias rather than the sole attention input.
+        #
+        # All inputs are l=0 (scalars/invariants) → SO(3) equivariance
+        # is preserved for the weighted aggregation of l≥1 features.
+
+        # Content attention dimension (bottleneck to save params)
+        d_attn = max(scalar_channels // 4, 8)
+        self.d_attn = d_attn
+
+        # Q/K projections for content-aware attention
+        self.q_proj = nn.Linear(scalar_channels, d_attn, bias=False)
+        self.k_proj = nn.Linear(scalar_channels, d_attn, bias=False)
+        # Attention vector: projects combined Q+K through nonlinearity → scalar
+        self.attn_vec = nn.Linear(d_attn, 1, bias=False)
+
+        # Geometric position bias (invariant features → scalar bias)
         # Base 7 invariant features (l=0, l=1):
         #   0. dist              — Euclidean distance (≥0)
         #   1. scalar_ratio      — ‖s_nbr‖ / ‖s_seed‖ (relative, ~1.0)
@@ -87,13 +115,10 @@ class EquivariantPool(nn.Module):
         #   6. ‖v_seed‖         — seed vector magnitude
         # +1 if type-2 enabled:
         #   7. ‖t2_nbr‖_mean    — neighbor type-2 norm (SO(3)-invariant)
-        #
-        # Per-feature BatchNorm ensures each feature has ~N(0,1) scale
-        # regardless of its physical units, preventing scale mismatch.
         n_inv_features = 7 + (1 if type2_channels > 0 else 0)
         self.attn_feat_norm = nn.BatchNorm1d(n_inv_features)
 
-        self.attn_mlp = nn.Sequential(
+        self.geo_mlp = nn.Sequential(
             nn.Linear(n_inv_features, attn_hidden),
             nn.SiLU(),
             nn.Linear(attn_hidden, 1),
@@ -102,7 +127,6 @@ class EquivariantPool(nn.Module):
         # Learnable temperature: logits are divided by exp(log_temp).
         # Initialized to log(1.0) = 0 (no effect). The network learns
         # to sharpen (temp < 1) or smooth (temp > 1) attention.
-        # This breaks the "softmax ice" where logit range is too small.
         self.log_temperature = nn.Parameter(torch.zeros(1))
 
     def forward(
@@ -250,14 +274,30 @@ class EquivariantPool(nn.Module):
 
             attn_input = torch.stack(feat_list, dim=-1)
 
+            # ── Part 2: Geometric position bias ──
             # Per-feature BatchNorm: [N_out, K, 7] → [N_out*K, 7] → normalize → reshape
             NK = N_out * K
             attn_flat = attn_input.reshape(NK, -1)       # [NK, 7]
             attn_normed = self.attn_feat_norm(attn_flat)  # [NK, 7]
             attn_normed = attn_normed.reshape(N_out, K, -1)  # [N_out, K, 7]
 
-            # MLP: [N_out, K, 7] → [N_out, K, 1] → [N_out, K]
-            attn_logits = self.attn_mlp(attn_normed).squeeze(-1)
+            # geo_bias: [N_out, K]
+            geo_bias = self.geo_mlp(attn_normed).squeeze(-1)  # [N_out, K]
+
+            # ── Part 1: Content attention (GATv2-style dynamic) ──
+            # Q from seed, K from neighbor — both l=0 scalars → invariant
+            Q = self.q_proj(seed_scalars)              # [N_out, d_attn]
+            K_feat = self.k_proj(nbr_scalars)          # [N_out, K, d_attn]
+
+            # GATv2: a^T * σ(Q_expand + K_feat) — dynamic because the
+            # ranking of neighbors changes based on the seed's features
+            combined = torch.nn.functional.silu(
+                Q.unsqueeze(1) + K_feat                # [N_out, K, d_attn]
+            )
+            content_score = self.attn_vec(combined).squeeze(-1)  # [N_out, K]
+
+            # ── Combined attention logits ──
+            attn_logits = content_score + geo_bias
 
             # Learnable temperature
             temperature = self.log_temperature.exp().clamp(min=0.01)
