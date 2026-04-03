@@ -33,6 +33,8 @@ Usage:
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -97,6 +99,13 @@ class EquivariantPool(nn.Module):
         # Content attention dimension (bottleneck to save params)
         d_attn = max(scalar_channels // 4, 8)
         self.d_attn = d_attn
+
+        # 1/√d_attn scaling (like Transformer attention).
+        # Without this, content_score variance grows with input scalar norm,
+        # forcing temperature to compensate instead of learning to discriminate.
+        self.register_buffer(
+            '_inv_sqrt_d', torch.tensor(1.0 / math.sqrt(d_attn)),
+        )
 
         # Q/K projections for content-aware attention
         self.q_proj = nn.Linear(scalar_channels, d_attn, bias=False)
@@ -294,7 +303,7 @@ class EquivariantPool(nn.Module):
             combined = torch.nn.functional.silu(
                 Q.unsqueeze(1) + K_feat                # [N_out, K, d_attn]
             )
-            content_score = self.attn_vec(combined).squeeze(-1)  # [N_out, K]
+            content_score = self.attn_vec(combined).squeeze(-1) * self._inv_sqrt_d  # [N_out, K]
 
             # ── Combined attention logits ──
             attn_logits = content_score + geo_bias

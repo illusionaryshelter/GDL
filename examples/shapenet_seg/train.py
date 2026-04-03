@@ -542,10 +542,21 @@ def main() -> None:
             v_inv_std = diag.get('v_inv_std', 0)
             diag_log += f" | v_inv={v_inv_norm:.4f}±{v_inv_std:.4f}"
 
-        # Pool attention temperature (Component 1)
-        pool_temp = diag.get('pool_temperature', None)
-        if pool_temp is not None:
-            diag_log += f" | pool_T={pool_temp:.3f}"
+        # Per-pool attention diagnostics (Component 1)
+        # Show per-pool temperature and uniformity to detect deep/shallow divergence
+        pool_temps = []
+        pool_unis = []
+        for i in range(args.num_stages - 1):
+            t_key = f'pool_T{i}'
+            u_key = f'pool_u{i}'
+            if t_key in diag:
+                pool_temps.append(f"T{i}={diag[t_key]:.3f}")
+            if u_key in diag:
+                pool_unis.append(f"u{i}={diag[u_key]:.2f}")
+        if pool_temps:
+            diag_log += f" | pool:[{','.join(pool_temps)}]"
+        if pool_unis:
+            diag_log += f" [{','.join(pool_unis)}]"
 
         if scaler_scale > 0:
             diag_log += f" | amp_scale={scaler_scale:.0f}"

@@ -153,7 +153,12 @@ class SE3PartSegNet(nn.Module):
         # Follows Vector Neurons (Deng et al., ICCV 2021) and MACE
         # readout principles: invariant contractions from equivariant reps.
         v_inv_dim = hidden_vector  # one norm per vector channel
-        self.v_inv_proj = nn.Linear(v_inv_dim, hidden_scalar // 2, bias=False)
+        v_inv_out = hidden_scalar // 2
+        self.v_inv_proj = nn.Linear(v_inv_dim, v_inv_out, bias=False)
+        # LayerNorm: ensures v_inv has comparable magnitude to other head
+        # inputs (s_out, multi-scale globals), preventing one component from
+        # dominating the head's first Linear simply due to scale mismatch.
+        self.v_inv_norm = nn.LayerNorm(v_inv_out)
 
         # ── Classification Head ──
         # Input: local scalar [N, C_s]
@@ -315,10 +320,10 @@ class SE3PartSegNet(nn.Module):
             # All features entering the head MUST be SO(3)-invariant.
             head_parts = [s_out]
 
-            # Vector invariant: ||v_c|| per channel → learned projection
+            # Vector invariant: ||v_c|| per channel → learned projection → LayerNorm
             # ||v_c|| = sqrt(sum_d v[c,d]²) is invariant under SO(3)
             v_norms = v_out.norm(dim=-1)  # [N, C_v]
-            v_inv = self.v_inv_proj(v_norms)  # [N, C_s // 2]
+            v_inv = self.v_inv_norm(self.v_inv_proj(v_norms))  # [N, C_s // 2]
             head_parts.append(v_inv)
 
             # Type-2 invariant: ||t2_c||² per channel
@@ -427,9 +432,9 @@ class SE3PartSegNet(nn.Module):
             # ── 6. Invariant feature extraction (same as forward) ──
             head_parts = [s_out]
 
-            # Vector invariant: ||v_c|| → learned projection
+            # Vector invariant: ||v_c|| → learned projection → LayerNorm
             v_norms = v_per_channel_norms  # reuse from diagnostics
-            v_inv = self.v_inv_proj(v_norms)  # [N, C_s // 2]
+            v_inv = self.v_inv_norm(self.v_inv_proj(v_norms))  # [N, C_s // 2]
             head_parts.append(v_inv)
 
             # Vector invariant diagnostics
@@ -453,17 +458,20 @@ class SE3PartSegNet(nn.Module):
         return logits, diag
 
     def get_pool_attn_stats(self) -> dict:
-        """Extract attention statistics from pool layers."""
+        """Extract attention statistics from pool layers.
+
+        Returns per-pool breakdowns in addition to averages for detailed
+        monitoring (e.g., deep pool may diverge while shallow is fine).
+        """
         import math
         entropies = []
         maxes = []
         temperatures = []
 
-        for layer in self.backbone.pool_layers:
+        for idx, layer in enumerate(self.backbone.pool_layers):
             if not hasattr(layer, '_last_attn_weights'):
                 continue
             w = layer._last_attn_weights     # [N_out, K]
-            m = layer._last_valid_mask        # [N_out, K]
 
             # Per-seed entropy
             log_w = torch.log(w.clamp(min=1e-10))
@@ -486,6 +494,14 @@ class SE3PartSegNet(nn.Module):
             'attn_uniform_ratio': (sum(entropies) / max(len(entropies), 1)) / max_ent
                                   if max_ent > 0 else 1.0,
         }
+
+        # Per-pool breakdowns: pool_T0, pool_T1, ...; pool_u0, pool_u1, ...
+        for i, (ent, mx, temp) in enumerate(zip(entropies, maxes, temperatures)):
+            stats[f'pool_T{i}'] = temp
+            stats[f'pool_u{i}'] = ent / max_ent if max_ent > 0 else 1.0
+            stats[f'pool_max{i}'] = mx
+
         if temperatures:
             stats['pool_temperature'] = sum(temperatures) / len(temperatures)
         return stats
+
