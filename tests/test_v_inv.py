@@ -129,12 +129,14 @@ def test_head_input_dimension():
         head_hidden=128,
     )
 
-    expected = C_s + C_s // 2 + C_t2 + C_s * num_stages + num_cats
+    # t2_inv is projected: Linear(C_t2, C_s//2) + LayerNorm → output dim = C_s//2
+    t2_inv_out = C_s // 2 if C_t2 > 0 else 0
+    expected = C_s + C_s // 2 + t2_inv_out + C_s * num_stages + num_cats
     assert model._head_in_dim == expected, (
         f"Head dim mismatch: expected {expected}, got {model._head_in_dim}"
     )
-    print(f"  [PASS] head_in_dim = {expected} (C_s={C_s} + C_s//2={C_s // 2} + "
-          f"C_t2={C_t2} + stages*C_s={num_stages * C_s} + cats={num_cats})")
+    print(f"  [PASS] head_in_dim = {expected} (C_s={C_s} + v_inv={C_s // 2} + "
+          f"t2_inv={t2_inv_out} + stages*C_s={num_stages * C_s} + cats={num_cats})")
 
 
 def test_gradient_flow_through_v_inv():

@@ -523,10 +523,6 @@ class SE3Conv(nn.Module):
                     graph.col_sorted, graph.perm,
                     graph.node_start, graph.node_end, N,
                 )
-                Cs = self.out_scalar_channels
-                s_out = all_out[:, :Cs]
-                v_out = all_out[:, Cs:Cs+Cv3].reshape(N, self.out_vector_channels, 3)
-                t2_out = all_out[:, Cs+Cv3:].reshape(N, self.out_type2_channels, 5)
             else:
                 # No type-2: fuse scalar + vector only (2→1 reduce)
                 all_msg = torch.cat([total_scalar_msg, v_msg_flat], dim=-1)
@@ -535,7 +531,27 @@ class SE3Conv(nn.Module):
                     graph.col_sorted, graph.perm,
                     graph.node_start, graph.node_end, N,
                 )
-                Cs = self.out_scalar_channels
+
+            # ── 4b. Batch-average degree normalization ──
+            # segment_reduce uses SUM. In multi-scale architectures,
+            # deeper stages have fewer points → each node has more
+            # neighbors within radius → SUM grows with depth.
+            #
+            # MACE divides by a global avg_num_neighbors constant.
+            # We use per-batch-average degree: same divisor for all
+            # nodes within a conv call, so within-stage density
+            # variation (boundary vs interior) is preserved.
+            # This is a HARD divisor (not learnable).
+            degree = (graph.node_end - graph.node_start).float()
+            avg_degree = degree.clamp(min=1).mean()
+            all_out = all_out / avg_degree
+
+            Cs = self.out_scalar_channels
+            if total_type2_msg is not None:
+                s_out = all_out[:, :Cs]
+                v_out = all_out[:, Cs:Cs+Cv3].reshape(N, self.out_vector_channels, 3)
+                t2_out = all_out[:, Cs+Cv3:].reshape(N, self.out_type2_channels, 5)
+            else:
                 s_out = all_out[:, :Cs]
                 v_out = all_out[:, Cs:].reshape(N, self.out_vector_channels, 3)
                 t2_out = None

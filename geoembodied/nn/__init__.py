@@ -16,7 +16,7 @@ Three sub-packages:
 
 Re-exports from all sub-packages for convenience::
 
-    from geoembodied.nn import SE3Net, GeoRegistrationModel
+    from geoembodied.nn import SE3Net, GeoRegistrationModel, lovasz_softmax
 """
 
 # ── Learnable modules ──
@@ -48,6 +48,11 @@ from geoembodied.nn.models import (
     SE3PartSegNet,
 )
 
+# ── Loss functions ──
+from geoembodied.nn.losses import (
+    lovasz_softmax,
+)
+
 __all__ = [
     # Modules
     "SE3Conv",
@@ -69,4 +74,6 @@ __all__ = [
     # Models
     "GeoRegistrationModel",
     "SE3PartSegNet",
+    # Losses
+    "lovasz_softmax",
 ]

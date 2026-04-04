@@ -113,6 +113,7 @@ class SE3PartSegNet(nn.Module):
         gate_mode: str = 'scalar',
         use_self_tp: bool = False,
         use_bottleneck_attn: bool = False,
+        normal_drop_rate: float = 0.0,
     ) -> None:
         super().__init__()
         self.num_categories = num_categories
@@ -122,6 +123,7 @@ class SE3PartSegNet(nn.Module):
         self.hidden_vector = hidden_vector
         self.hidden_type2 = hidden_type2
         self.num_stages = num_stages
+        self.normal_drop_rate = normal_drop_rate
 
         # U-Net backbone
         self.backbone = MultiScaleSE3Net(
@@ -148,7 +150,7 @@ class SE3PartSegNet(nn.Module):
         #
         # ||v_c|| = sqrt(v_c · v_c) is SO(3)-invariant per channel.
         # This linear map learns which combinations of vector channel
-        # magnitudes are informative for part classification.
+        # magnitudes are informative for downstream tasks.
         #
         # Follows Vector Neurons (Deng et al., ICCV 2021) and MACE
         # readout principles: invariant contractions from equivariant reps.
@@ -160,17 +162,33 @@ class SE3PartSegNet(nn.Module):
         # dominating the head's first Linear simply due to scale mismatch.
         self.v_inv_norm = nn.LayerNorm(v_inv_out)
 
+        # ── Type-2 Invariant Projection ──
+        # Extract SO(3)-invariant information from type-2 (l=2) features.
+        #
+        # ||t2_c||² = Σ_m |t2_{c,m}|² is the l=2 Casimir invariant,
+        # guaranteed invariant under SO(3): ||D²(R) t2||² = ||t2||².
+        #
+        # Uses the SAME readout pattern as v_inv:
+        #   invariant contraction → learned projection → LayerNorm
+        # Without projection+normalization, t2_inv has activation std ≈ 0.03
+        # while normalized features have std ≈ 1.0 — a 32x scale mismatch
+        # that makes the head unable to effectively utilize type-2 information.
+        t2_inv_out = hidden_scalar // 2 if hidden_type2 > 0 else 0
+        if hidden_type2 > 0:
+            self.t2_inv_proj = nn.Linear(hidden_type2, t2_inv_out, bias=False)
+            self.t2_inv_norm = nn.LayerNorm(t2_inv_out)
+
         # ── Classification Head ──
         # Input: local scalar [N, C_s]
         #        + vector invariant [N, C_s // 2] (projected ||v_c||)
-        #        + type-2 invariant [N, C_t2] (||t2_c||²)
+        #        + type-2 invariant [N, C_s // 2] (projected ||t2_c||)
         #        + multi-scale globals [N, num_stages * C_s]
         #        + category one-hot [N, num_categories]
         # Output: logits [N, num_parts]
         head_in = (
             hidden_scalar           # s_out
             + hidden_scalar // 2    # v_inv (projected vector norms)
-            + hidden_type2          # t2_inv (type-2 norms²)
+            + t2_inv_out            # t2_inv (projected type-2 norms)
             + hidden_scalar * num_stages  # multi-scale globals
             + num_categories        # category one-hot
         )
@@ -282,6 +300,19 @@ class SE3PartSegNet(nn.Module):
             if self.use_normals and normals is not None:
                 v_init = self.inject_normals(normals)  # [N, C_v, 3]
 
+                # Per-channel vector dropout (SO(3)-safe)
+                # Zero entire 3D vectors per channel to:
+                # 1. Model partial normal estimation failure (occlusion/noise)
+                # 2. Prevent over-reliance on any single vector channel
+                # A zero 3D vector is invariant under all rotations → equivariant ✅
+                if self.training and self.normal_drop_rate > 0:
+                    drop_mask = (
+                        torch.rand(v_init.shape[0], v_init.shape[1], 1,
+                                   device=v_init.device, dtype=v_init.dtype)
+                        > self.normal_drop_rate
+                    )  # [N, C_v, 1] — broadcast over xyz
+                    v_init = v_init * drop_mask
+
             # ── 2. Run U-Net backbone (with encoder features for multi-scale head) ──
             backbone_out = self.backbone(
                 pos, ptr, features=features, v_init=v_init,
@@ -326,9 +357,11 @@ class SE3PartSegNet(nn.Module):
             v_inv = self.v_inv_norm(self.v_inv_proj(v_norms))  # [N, C_s // 2]
             head_parts.append(v_inv)
 
-            # Type-2 invariant: ||t2_c||² per channel
+            # Type-2 invariant: ||t2_c|| per channel → learned projection → LayerNorm
+            # ||t2_c||² is the l=2 Casimir invariant (SO(3)-invariant)
             if t2_out is not None and self.hidden_type2 > 0:
-                t2_inv = (t2_out * t2_out).sum(dim=-1)  # [N, C_t2]
+                t2_norms = t2_out.norm(dim=-1)  # [N, C_t2]
+                t2_inv = self.t2_inv_norm(self.t2_inv_proj(t2_norms))  # [N, C_s // 2]
                 head_parts.append(t2_inv)
             head_parts.extend([multi_scale, one_hot])
 
@@ -445,8 +478,11 @@ class SE3PartSegNet(nn.Module):
             diag['head_in_dim'] = self._head_in_dim
 
             if t2_out is not None and self.hidden_type2 > 0:
-                t2_inv = (t2_out * t2_out).sum(dim=-1)
+                t2_norms = t2_out.norm(dim=-1)  # [N, C_t2]
+                t2_inv = self.t2_inv_norm(self.t2_inv_proj(t2_norms))  # [N, C_s // 2]
                 head_parts.append(t2_inv)
+                diag['t2_inv_norm'] = t2_inv.norm(dim=-1).mean().item()
+                diag['t2_inv_std'] = t2_inv.std(dim=0).mean().item()
             head_parts.extend([multi_scale, one_hot])
 
             head_input = torch.cat(head_parts, dim=1)

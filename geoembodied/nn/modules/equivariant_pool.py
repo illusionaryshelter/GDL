@@ -33,7 +33,7 @@ Usage:
 
 from __future__ import annotations
 
-import math
+
 
 import torch
 import torch.nn as nn
@@ -100,12 +100,11 @@ class EquivariantPool(nn.Module):
         d_attn = max(scalar_channels // 4, 8)
         self.d_attn = d_attn
 
-        # 1/√d_attn scaling (like Transformer attention).
-        # Without this, content_score variance grows with input scalar norm,
-        # forcing temperature to compensate instead of learning to discriminate.
-        self.register_buffer(
-            '_inv_sqrt_d', torch.tensor(1.0 / math.sqrt(d_attn)),
-        )
+        # NOTE: No 1/√d_attn scaling here. Scaling is needed for
+        # dot-product attention (Q·K) where variance grows with d_k.
+        # Our attention is ADDITIVE (GATv2: a^T · σ(Q + K)), which
+        # does not suffer from variance-grows-with-dimension.
+        # The learnable temperature provides sufficient logit control.
 
         # Q/K projections for content-aware attention
         self.q_proj = nn.Linear(scalar_channels, d_attn, bias=False)
@@ -303,7 +302,7 @@ class EquivariantPool(nn.Module):
             combined = torch.nn.functional.silu(
                 Q.unsqueeze(1) + K_feat                # [N_out, K, d_attn]
             )
-            content_score = self.attn_vec(combined).squeeze(-1) * self._inv_sqrt_d  # [N_out, K]
+            content_score = self.attn_vec(combined).squeeze(-1)  # [N_out, K]
 
             # ── Combined attention logits ──
             attn_logits = content_score + geo_bias

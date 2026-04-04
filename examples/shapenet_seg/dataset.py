@@ -232,27 +232,12 @@ def _load_h5_files(
             label = torch.from_numpy(part_labels[i]).long()  # [N_raw]
             cat_idx = int(cat_labels[i])
 
-            # Subsample if needed
-            if num_points < N_raw:
-                idx = torch.randperm(N_raw)[:num_points]
-                pos = pos[idx]
-                normal = normal[idx]
-                label = label[idx]
-
-            # Normalize to unit sphere
-            if normalize:
-                center = pos.mean(dim=0)
-                pos = pos - center
-                scale = pos.norm(dim=-1).max().clamp(min=1e-6)
-                pos = pos / scale
-
-            # Normalize normals to unit length
-            normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-
+            # Store ALL points — subsample + normalize at runtime
+            # in __getitem__ for proper augmentation.
             data_list.append({
-                'pos': pos,
-                'normal': normal,
-                'label': label,
+                'pos': pos,           # [N_raw, 3] raw positions
+                'normal': normal,     # [N_raw, 3] raw normals
+                'label': label,       # [N_raw] part labels
                 'cat_idx': cat_idx,
             })
 
@@ -386,11 +371,20 @@ class ShapeNetPartDataset(Dataset):
         num_points: int = NUM_POINTS,
         normalize: bool = True,
         download: bool = True,
+        train: bool = True,
+        augment_scale: Tuple[float, float] = (0.8, 1.2),
+        augment_jitter: float = 0.005,
+        augment_jitter_clip: float = 0.02,
     ) -> None:
         super().__init__()
         self.root = root
         self.split = split
         self.num_points = num_points
+        self.normalize = normalize
+        self.train = train
+        self.augment_scale = augment_scale
+        self.augment_jitter = augment_jitter
+        self.augment_jitter_clip = augment_jitter_clip
 
         # Auto-detect format
         h5_files = glob.glob(osp.join(root, '*.h5'))
@@ -401,7 +395,7 @@ class ShapeNetPartDataset(Dataset):
 
         if h5_files:
             print(f"Detected HDF5 format in {root}")
-            self.data = _load_h5_files(root, split, num_points, normalize)
+            self.data = _load_h5_files(root, split, num_points, normalize=False)
         elif osp.isdir(txt_dir):
             print(f"Detected TXT format in {root}")
             self.data = _load_txt_files(root, split, num_points, normalize, download=False)
@@ -416,7 +410,60 @@ class ShapeNetPartDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Dict[str, Tensor]:
-        return self.data[idx]
+        item = self.data[idx]
+        pos = item['pos']         # [N_raw, 3]
+        normal = item['normal']   # [N_raw, 3]
+        label = item['label']     # [N_raw]
+        cat_idx = item['cat_idx']
+
+        N_raw = pos.shape[0]
+
+        # ── Runtime random subsampling ──
+        # Critical: each epoch sees a DIFFERENT subset of points.
+        # This is equivalent to massive data augmentation for free.
+        if N_raw > self.num_points:
+            idx_sub = torch.randperm(N_raw)[:self.num_points]
+            pos = pos[idx_sub]
+            normal = normal[idx_sub]
+            label = label[idx_sub]
+        elif N_raw < self.num_points:
+            idx_sub = torch.cat([
+                torch.arange(N_raw),
+                torch.randint(0, N_raw, (self.num_points - N_raw,)),
+            ])
+            pos = pos[idx_sub]
+            normal = normal[idx_sub]
+            label = label[idx_sub]
+
+        # ── Training augmentations (physical reality, not symmetry tricks) ──
+        if self.train:
+            # 1. Isotropic scaling: models object at varying sensor distances
+            lo, hi = self.augment_scale
+            scale = torch.empty(1).uniform_(lo, hi).item()
+            pos = pos * scale
+
+            # 2. Coordinate jitter: models sensor quantization noise
+            if self.augment_jitter > 0:
+                noise = torch.randn_like(pos) * self.augment_jitter
+                noise.clamp_(-self.augment_jitter_clip, self.augment_jitter_clip)
+                pos = pos + noise
+
+        # ── Normalize to unit sphere (AFTER augmentation) ──
+        if self.normalize:
+            center = pos.mean(dim=0)
+            pos = pos - center
+            r = pos.norm(dim=-1).max().clamp(min=1e-6)
+            pos = pos / r
+
+        # ── Normalize normals to unit length ──
+        normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        return {
+            'pos': pos,
+            'normal': normal,
+            'label': label,
+            'cat_idx': cat_idx,
+        }
 
 
 def collate_fn(

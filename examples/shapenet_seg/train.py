@@ -70,6 +70,7 @@ from examples.shapenet_seg.dataset import (
     NUM_CATEGORIES,
 )
 from examples.shapenet_seg.model import SE3PartSegNet
+from geoembodied.nn.losses import lovasz_softmax
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -170,6 +171,8 @@ def train_one_epoch(
     diag_every: int = 50,
     grad_clip: float = 1.0,
     amp_max_scale: float = 2**30,  # effectively disabled — model runs FP32
+    label_smoothing: float = 0.0,
+    lovasz_weight: float = 0.0,
 ) -> Tuple[float, float, dict]:
     """Train for one epoch.
 
@@ -212,7 +215,29 @@ def train_one_epoch(
             else:
                 logits = model(pos, ptr, cat_indices, normals=normals)
 
-            loss = nn.functional.cross_entropy(logits, labels)
+            # ── Loss computation ──
+            # Category masking sets invalid part logits to -inf.
+            # Standard F.cross_entropy(label_smoothing=s) distributes
+            # s/C probability to ALL classes including -inf ones,
+            # causing log_softmax(-inf) = -inf → loss = inf.
+            # Fix: compute label smoothing manually over valid classes.
+            if label_smoothing > 0:
+                log_p = nn.functional.log_softmax(logits, dim=1)  # [N, C]
+                # Hard target (NLL) — always finite since labels are valid
+                nll = nn.functional.nll_loss(log_p, labels)
+                # Smooth target — only over unmasked (non -inf) classes
+                valid = logits > -1e30  # [N, C] bool
+                n_valid = valid.sum(dim=1, keepdim=True).clamp(min=1)  # [N, 1]
+                # CRITICAL: -inf * 0 = NaN (IEEE 754), so use where not mul
+                log_p_safe = torch.where(valid, log_p, torch.zeros_like(log_p))
+                smooth = -log_p_safe.sum(dim=1) / n_valid.squeeze(1)
+                ce_loss = (1 - label_smoothing) * nll + label_smoothing * smooth.mean()
+            else:
+                ce_loss = nn.functional.cross_entropy(logits, labels)
+
+            loss = ce_loss
+            if lovasz_weight > 0:
+                loss = loss + lovasz_weight * lovasz_softmax(logits, labels)
             loss = loss / accum_steps
 
         # Backward with scaler
@@ -359,6 +384,17 @@ def main() -> None:
                         help='Classification head hidden dim')
     parser.add_argument('--compile', action='store_true',
                         help='Enable torch.compile(dynamic=True) for kernel fusion')
+    # ── Training recipe (anti-overfitting) ──
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='Label smoothing for CE loss (0.1 recommended)')
+    parser.add_argument('--lovasz_weight', type=float, default=0.0,
+                        help='Weight for Lovász-Softmax loss (1.0 recommended). '
+                             'Directly optimizes mIoU.')
+    parser.add_argument('--normal_drop_rate', type=float, default=0.0,
+                        help='Per-channel vector dropout rate for normal features '
+                             '(0.3 recommended). SO(3)-safe.')
+    parser.add_argument('--warmup_epochs', type=int, default=0,
+                        help='Linear LR warmup epochs (5 recommended)')
     args = parser.parse_args()
     if args.no_self_tp:
         args.use_self_tp = False
@@ -389,14 +425,18 @@ def main() -> None:
     print(f"torch.compile: {'ON (dynamic=True)' if args.compile else 'OFF'}")
     print(f"Batch: {args.batch_size} × {args.accum_steps} accum = "
           f"{args.batch_size * args.accum_steps} effective")
+    print(f"Label smoothing: {args.label_smoothing}")
+    print(f"Lovász weight: {args.lovasz_weight} {'(OFF)' if args.lovasz_weight == 0 else '(IoU-direct)'}")
+    print(f"Normal drop rate: {args.normal_drop_rate} {'(OFF)' if args.normal_drop_rate == 0 else '(per-channel)'}")
+    print(f"Warmup: {args.warmup_epochs} epochs {'(OFF)' if args.warmup_epochs == 0 else '(linear)'}")
     print()
 
     # ── Datasets ──
     train_dataset = ShapeNetPartDataset(
-        args.data_root, split='trainval', normalize=True
+        args.data_root, split='trainval', normalize=True, train=True,
     )
     test_dataset = ShapeNetPartDataset(
-        args.data_root, split='test', normalize=True
+        args.data_root, split='test', normalize=True, train=False,
     )
 
     nw = args.num_workers
@@ -437,6 +477,7 @@ def main() -> None:
         gate_mode=args.gate_mode,
         use_self_tp=args.use_self_tp,
         use_bottleneck_attn=args.use_bottleneck_attn,
+        normal_drop_rate=args.normal_drop_rate,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -475,6 +516,25 @@ def main() -> None:
         optimizer, T_max=args.epochs, eta_min=1e-5
     )
 
+    # Linear warmup: general optimizer best practice (NeurIPS 2024).
+    # Lets Adam's adaptive moment estimates converge before applying
+    # full lr. Especially important for GDL where SE3Conv gradient
+    # variance at initialization is high.
+    warmup_epochs = args.warmup_epochs
+    if warmup_epochs > 0:
+        from torch.optim.lr_scheduler import LinearLR, SequentialLR
+        warmup_scheduler = LinearLR(
+            optimizer, start_factor=1e-2, total_iters=warmup_epochs
+        )
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs - warmup_epochs, eta_min=1e-5
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+
     # AMP GradScaler: The SE3PartSegNet model disables autocast
     # internally (all geometric ops + nn.Linear run in FP32), so the
     # scaler effectively becomes a no-op.  We keep it for API
@@ -500,6 +560,8 @@ def main() -> None:
             model, train_loader, optimizer, scaler, device,
             accum_steps=args.accum_steps, use_amp=use_amp,
             grad_clip=args.grad_clip,
+            label_smoothing=args.label_smoothing,
+            lovasz_weight=args.lovasz_weight,
         )
         scheduler.step()
 
@@ -541,6 +603,12 @@ def main() -> None:
         if v_inv_norm is not None:
             v_inv_std = diag.get('v_inv_std', 0)
             diag_log += f" | v_inv={v_inv_norm:.4f}±{v_inv_std:.4f}"
+
+        # Type-2 → head invariant diagnostics
+        t2_inv_norm = diag.get('t2_inv_norm', None)
+        if t2_inv_norm is not None:
+            t2_inv_std = diag.get('t2_inv_std', 0)
+            diag_log += f" | t2_inv={t2_inv_norm:.4f}±{t2_inv_std:.4f}"
 
         # Per-pool attention diagnostics (Component 1)
         # Show per-pool temperature and uniformity to detect deep/shallow divergence

@@ -58,6 +58,7 @@ class SE3PartSegNet(_SE3PartSegNet):
         gate_mode: str = 'scalar',
         use_self_tp: bool = False,
         use_bottleneck_attn: bool = False,
+        normal_drop_rate: float = 0.0,
     ) -> None:
         super().__init__(
             num_categories=NUM_CATEGORIES,
@@ -75,4 +76,5 @@ class SE3PartSegNet(_SE3PartSegNet):
             gate_mode=gate_mode,
             use_self_tp=use_self_tp,
             use_bottleneck_attn=use_bottleneck_attn,
+            normal_drop_rate=normal_drop_rate,
         )
