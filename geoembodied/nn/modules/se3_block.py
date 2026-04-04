@@ -3,23 +3,37 @@
 
 """SE(3)-equivariant interaction block.
 
-Single interaction layer: Conv → Norm → Gate → [SelfTP] → Learnable Skip Residual.
+Single interaction layer:
+
+    Conv → InnerNorm → Gate → [SelfTP] → Skip Residual → **OutputNorm**
 
 Supports scalar (l=0), vector (l=1), and type-2 (l=2) features.
 
-**Residual design (MACE/NequIP pattern):**
-    output = conv_branch(x) + skip_scale * x
+**Dual normalization (hard constraint against catastrophic blowup):**
 
-    Unlike the naive ``(f(x) + x) / √2``, the skip contribution is
-    controlled by **per-channel learnable scale parameters** initialised
-    to ``1/√2``.  This gives the optimiser a "knob" to damp the skip
-    path if features begin to diverge — exactly matching the
-    FullyConnectedTensorProduct skip used in MACE (NeurIPS 2022) and
-    the self-connection Linear in NequIP (Nature Comm. 2022).
+    The **inner norm** (after conv, before gate) controls the conv
+    output scale — same as NequIP/MACE.
 
-    The conv branch is NOT scaled (receives full gradient), so its
-    initial influence is √2× larger than the old scheme, compensating
-    the "pure residual" degeneration previously observed.
+    The **output norm** (after residual) is the critical addition.
+    Without it, the skip path can inject unbounded feature norms
+    into downstream blocks, causing exponential blowup in deep stages
+    (observed: s2 → 3.6×10¹¹ in a single epoch at stage 2).
+
+    This is NOT Pre-Norm (which normalises the input TO conv → starves
+    conv contribution). The conv sees its RAW input, gets normalised
+    by inner norm + gate, then the TOTAL output (conv + skip) is
+    bounded by output norm.  This guarantees:
+        - Conv always operates on its natural scale → no contribution collapse
+        - Output is always bounded → no catastrophic amplification
+        - Each block feeds ~O(1) features to the next block
+
+    Mathematically: Pre-Norm = x + f(norm(x)), output never bounded.
+    This design  = norm(f(x) + skip·x), output ALWAYS bounded.
+
+**Learnable skip (MACE/NequIP pattern):**
+
+    Per-channel skip_scale initialised to 1/√2, giving the optimiser
+    fine-grained control over the residual contribution.
 
 Self-Interaction TP (optional, use_self_tp=True):
     - v·v → scalar (ν=2 body order)
@@ -53,13 +67,16 @@ class SE3NetBlock(nn.Module):
 
     Architecture::
 
-        (s, v, [t2]) → SE3Conv → EquivariantLayerNorm → GatedNonlinearity
-                                                               │
-                                                    [+ SelfTP: v·v, t2·t2 → s]
-                                                               │
-                                                     [+ skip_scale · input]
-                                                               │
-                                                          (s_out, v_out, [t2_out])
+        (s, v, [t2]) → SE3Conv → InnerNorm → Gate → [SelfTP]
+                                                        │
+                                              [+ skip_scale · input]
+                                                        │
+                                                  OutputNorm
+                                                        │
+                                                   (s_out, v_out, [t2_out])
+
+    The inner norm controls conv output; the output norm prevents
+    catastrophic residual amplification across stacked blocks.
 
     The ``skip_*_scale`` parameters are **per-channel, per-block**
     (NOT shared across modules).  For l≥1 features the scale is a
@@ -106,6 +123,7 @@ class SE3NetBlock(nn.Module):
             max_num_neighbors=max_num_neighbors,
         )
 
+        # Inner norm: controls conv output before gate
         self.norm = EquivariantLayerNorm(
             num_scalars=channels_scalar,
             num_vectors=channels_vector,
@@ -117,6 +135,15 @@ class SE3NetBlock(nn.Module):
             num_vectors=channels_vector,
             num_type2=channels_type2,
             gate_mode=gate_mode,
+        )
+
+        # Output norm: hard constraint on post-residual features.
+        # Prevents catastrophic norm amplification across stacked blocks.
+        # Uses separate running stats from inner norm.
+        self.output_norm = EquivariantLayerNorm(
+            num_scalars=channels_scalar,
+            num_vectors=channels_vector,
+            num_type2=channels_type2,
         )
 
         # ── Learnable skip projections (MACE/NequIP pattern) ──
@@ -164,7 +191,7 @@ class SE3NetBlock(nn.Module):
         graph: 'SpatialGraph',
         type2: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
-        """Forward pass: Conv → Norm → Gate → [SelfTP] → Learnable Skip.
+        """Forward pass: Conv → InnerNorm → Gate → [SelfTP] → Skip → OutputNorm.
 
         Args:
             scalars: [N, channels_scalar], representation: SO(3) type-0
@@ -178,26 +205,26 @@ class SE3NetBlock(nn.Module):
         """
         has_type2 = type2 is not None and self.channels_type2 > 0
 
-        # Conv
+        # ── Conv ──
         if has_type2:
             s_new, v_new, t2_new = self.conv(scalars, vectors, graph, type2=type2)
         else:
             s_new, v_new = self.conv(scalars, vectors, graph)
             t2_new = None
 
-        # Norm
+        # ── Inner Norm (controls conv output scale) ──
         if t2_new is not None:
             s_new, v_new, t2_new = self.norm(s_new, v_new, t2_new)
         else:
             s_new, v_new = self.norm(s_new, v_new)
 
-        # Gate
+        # ── Gate ──
         if t2_new is not None:
             s_new, v_new, t2_new = self.gate(s_new, v_new, t2_new)
         else:
             s_new, v_new = self.gate(s_new, v_new)
 
-        # Self-Interaction TP
+        # ── Self-Interaction TP ──
         if self.self_tp_proj is not None:
             tp_inputs = []
             if self.channels_vector > 0:
@@ -212,20 +239,21 @@ class SE3NetBlock(nn.Module):
                 s_new = s_new + s_tp
 
         # ── Learnable skip residual ──
-        # output = conv_branch + skip_scale * input
-        # skip_scale is per-channel, per-block, learnable.
-        # Equivariance: scalar multiplication on each channel is SO(3)-invariant.
         if self.use_residual:
-            # l=0: per-channel scale, shape [C_s]
             s_new = s_new + scalars * self.skip_s_scale
-
-            # l=1: per-channel scale, shape [C_v, 1] broadcast over xyz
             if self.skip_v_scale is not None:
                 v_new = v_new + vectors * self.skip_v_scale.unsqueeze(-1)
-
-            # l=2: per-channel scale, shape [C_t2, 1] broadcast over 5 components
             if t2_new is not None and type2 is not None and self.skip_t2_scale is not None:
                 t2_new = t2_new + type2 * self.skip_t2_scale.unsqueeze(-1)
+
+        # ── Output norm (hard constraint: bounds post-residual features) ──
+        # This is the critical difference from Pre-Norm:
+        #   Pre-Norm:  x + f(norm(x))  → output unbounded (skip bypasses norm)
+        #   This:      norm(f(x) + skip·x) → output ALWAYS bounded
+        if t2_new is not None:
+            s_new, v_new, t2_new = self.output_norm(s_new, v_new, t2_new)
+        else:
+            s_new, v_new = self.output_norm(s_new, v_new)
 
         if has_type2 and t2_new is not None:
             return s_new, v_new, t2_new

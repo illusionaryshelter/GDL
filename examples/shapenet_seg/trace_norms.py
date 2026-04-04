@@ -73,7 +73,7 @@ class NormTracer:
         return {k: sum(v) / len(v) if v else 0.0
                 for k, v in self.trace.items()}
 
-    # ── Block hook (Post-Norm path: Conv → Norm → Gate → Residual) ──
+    # ── Block hook (Conv → InnerNorm → Gate → Skip → OutputNorm) ──
 
     def _hook_block(self, si: int, bi: int, blk) -> None:
         tr = self.trace
@@ -93,7 +93,7 @@ class NormTracer:
                 t2 = None
             tr[f'{p}_conv'].append(s.detach().norm(dim=-1).mean().item())
 
-            # Norm (Post-Norm: normalize conv output)
+            # Inner Norm
             if t2 is not None:
                 s, v, t2 = blk.norm(s, v, t2)
             else:
@@ -125,6 +125,12 @@ class NormTracer:
                 if (t2 is not None and type2 is not None
                         and blk.skip_t2_scale is not None):
                     t2 = t2 + type2 * blk.skip_t2_scale.unsqueeze(-1)
+
+            # Output norm (hard constraint: bounds post-residual features)
+            if t2 is not None:
+                s, v, t2 = blk.output_norm(s, v, t2)
+            else:
+                s, v = blk.output_norm(s, v)
             tr[f'{p}_out'].append(s.detach().norm(dim=-1).mean().item())
 
             if has_t2 and t2 is not None:
