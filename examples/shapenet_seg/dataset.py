@@ -371,20 +371,12 @@ class ShapeNetPartDataset(Dataset):
         num_points: int = NUM_POINTS,
         normalize: bool = True,
         download: bool = True,
-        train: bool = True,
-        augment_scale: Tuple[float, float] = (0.8, 1.2),
-        augment_jitter: float = 0.005,
-        augment_jitter_clip: float = 0.02,
     ) -> None:
         super().__init__()
         self.root = root
         self.split = split
         self.num_points = num_points
         self.normalize = normalize
-        self.train = train
-        self.augment_scale = augment_scale
-        self.augment_jitter = augment_jitter
-        self.augment_jitter_clip = augment_jitter_clip
 
         # Auto-detect format
         h5_files = glob.glob(osp.join(root, '*.h5'))
@@ -435,20 +427,7 @@ class ShapeNetPartDataset(Dataset):
             normal = normal[idx_sub]
             label = label[idx_sub]
 
-        # ── Training augmentations (physical reality, not symmetry tricks) ──
-        if self.train:
-            # 1. Isotropic scaling: models object at varying sensor distances
-            lo, hi = self.augment_scale
-            scale = torch.empty(1).uniform_(lo, hi).item()
-            pos = pos * scale
-
-            # 2. Coordinate jitter: models sensor quantization noise
-            if self.augment_jitter > 0:
-                noise = torch.randn_like(pos) * self.augment_jitter
-                noise.clamp_(-self.augment_jitter_clip, self.augment_jitter_clip)
-                pos = pos + noise
-
-        # ── Normalize to unit sphere (AFTER augmentation) ──
+        # ── Normalize to unit sphere ──
         if self.normalize:
             center = pos.mean(dim=0)
             pos = pos - center

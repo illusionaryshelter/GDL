@@ -390,9 +390,7 @@ def main() -> None:
     parser.add_argument('--lovasz_weight', type=float, default=0.0,
                         help='Weight for Lovász-Softmax loss (1.0 recommended). '
                              'Directly optimizes mIoU.')
-    parser.add_argument('--normal_drop_rate', type=float, default=0.0,
-                        help='Per-channel vector dropout rate for normal features '
-                             '(0.3 recommended). SO(3)-safe.')
+
     parser.add_argument('--warmup_epochs', type=int, default=0,
                         help='Linear LR warmup epochs (5 recommended)')
     args = parser.parse_args()
@@ -427,16 +425,16 @@ def main() -> None:
           f"{args.batch_size * args.accum_steps} effective")
     print(f"Label smoothing: {args.label_smoothing}")
     print(f"Lovász weight: {args.lovasz_weight} {'(OFF)' if args.lovasz_weight == 0 else '(IoU-direct)'}")
-    print(f"Normal drop rate: {args.normal_drop_rate} {'(OFF)' if args.normal_drop_rate == 0 else '(per-channel)'}")
+
     print(f"Warmup: {args.warmup_epochs} epochs {'(OFF)' if args.warmup_epochs == 0 else '(linear)'}")
     print()
 
     # ── Datasets ──
     train_dataset = ShapeNetPartDataset(
-        args.data_root, split='trainval', normalize=True, train=True,
+        args.data_root, split='trainval', normalize=True,
     )
     test_dataset = ShapeNetPartDataset(
-        args.data_root, split='test', normalize=True, train=False,
+        args.data_root, split='test', normalize=True,
     )
 
     nw = args.num_workers
@@ -477,7 +475,7 @@ def main() -> None:
         gate_mode=args.gate_mode,
         use_self_tp=args.use_self_tp,
         use_bottleneck_attn=args.use_bottleneck_attn,
-        normal_drop_rate=args.normal_drop_rate,
+
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

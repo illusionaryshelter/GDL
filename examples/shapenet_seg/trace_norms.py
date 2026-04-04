@@ -161,11 +161,6 @@ def main():
     p.add_argument('--lr', type=float, default=1e-3)
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--device', type=str, default='cuda')
-    # Control variables — default to OLD training settings for fair comparison
-    p.add_argument('--normal_drop_rate', type=float, default=0.0,
-                   help='Per-channel vector dropout (0.0=old baseline, 0.3=new)')
-    p.add_argument('--no_augment', action='store_true',
-                   help='Disable dataset augmentation (matches old training)')
     args = p.parse_args()
 
     dev = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -173,10 +168,9 @@ def main():
     if dev.type == 'cuda':
         print(f'GPU: {torch.cuda.get_device_name(0)}')
 
-    # ── Data (train=False by default to match old baseline) ──
-    use_augment = not args.no_augment
+    # ── Data ──
     ds = ShapeNetPartDataset(args.data_root, split='trainval',
-                             normalize=True, train=use_augment)
+                             normalize=True)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                     collate_fn=collate_fn, num_workers=args.workers,
                     pin_memory=True, drop_last=True,
@@ -186,8 +180,6 @@ def main():
         args.batches, total_batches)
     print(f'Data: {len(ds)} shapes, {total_batches} batches/epoch, '
           f'using {use_batches}')
-    print(f'Augmentation: {"ON" if use_augment else "OFF"}')
-    print(f'Normal drop rate: {args.normal_drop_rate}')
 
     # ── Model (production size) ──
     model = SE3PartSegNet(
@@ -196,7 +188,6 @@ def main():
         num_stages=3, layers_per_stage=2, pool_ratio=0.25,
         head_hidden=256, use_normals=True, gate_mode='norm',
         use_self_tp=True, use_bottleneck_attn=True,
-        normal_drop_rate=args.normal_drop_rate,
     ).to(dev)
     print(f'Parameters: {sum(p.numel() for p in model.parameters()):,}')
 

@@ -113,7 +113,6 @@ class SE3PartSegNet(nn.Module):
         gate_mode: str = 'scalar',
         use_self_tp: bool = False,
         use_bottleneck_attn: bool = False,
-        normal_drop_rate: float = 0.0,
     ) -> None:
         super().__init__()
         self.num_categories = num_categories
@@ -123,7 +122,6 @@ class SE3PartSegNet(nn.Module):
         self.hidden_vector = hidden_vector
         self.hidden_type2 = hidden_type2
         self.num_stages = num_stages
-        self.normal_drop_rate = normal_drop_rate
 
         # U-Net backbone
         self.backbone = MultiScaleSE3Net(
@@ -299,19 +297,6 @@ class SE3PartSegNet(nn.Module):
             v_init = None
             if self.use_normals and normals is not None:
                 v_init = self.inject_normals(normals)  # [N, C_v, 3]
-
-                # Per-channel vector dropout (SO(3)-safe)
-                # Zero entire 3D vectors per channel to:
-                # 1. Model partial normal estimation failure (occlusion/noise)
-                # 2. Prevent over-reliance on any single vector channel
-                # A zero 3D vector is invariant under all rotations → equivariant ✅
-                if self.training and self.normal_drop_rate > 0:
-                    drop_mask = (
-                        torch.rand(v_init.shape[0], v_init.shape[1], 1,
-                                   device=v_init.device, dtype=v_init.dtype)
-                        > self.normal_drop_rate
-                    )  # [N, C_v, 1] — broadcast over xyz
-                    v_init = v_init * drop_mask
 
             # ── 2. Run U-Net backbone (with encoder features for multi-scale head) ──
             backbone_out = self.backbone(
