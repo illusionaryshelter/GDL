@@ -76,6 +76,7 @@ class SpatialGraph:
     # ── Metadata ──
     N: int               # number of nodes
     E: int               # number of edges
+    avg_degree: Optional[Tensor] = None  # [N] float32 — per-node avg degree of its cloud
 
     @staticmethod
     def build(
@@ -130,6 +131,24 @@ class SpatialGraph:
         # 4. Sort by target + build CSR for segment reduce
         col_sorted, perm, node_start, node_end = sort_and_build_csr(col, N)
 
+        # 5. Per-cloud average degree (batch-isolation safe)
+        #    Each node stores the average degree of its cloud, so the
+        #    normalization divisor is identical whether the cloud is
+        #    processed alone or in a batch.  shape: [N]
+        degree = (node_end - node_start).float()  # [N]
+        if batch is not None:
+            # scatter_mean: per‑cloud average, then broadcast back
+            B_count = int(batch.max().item()) + 1
+            cloud_sum = torch.zeros(B_count, device=device)
+            cloud_cnt = torch.zeros(B_count, device=device)
+            cloud_sum.scatter_add_(0, batch, degree)
+            cloud_cnt.scatter_add_(0, batch, torch.ones_like(degree))
+            cloud_avg = cloud_sum / cloud_cnt.clamp(min=1)  # [B]
+            per_node_avg = cloud_avg[batch]  # [N]
+        else:
+            per_node_avg = degree.mean().expand(N)  # single cloud
+        per_node_avg = per_node_avg.clamp(min=1.0)  # safety
+
         return SpatialGraph(
             row=row,
             col=col,
@@ -142,6 +161,7 @@ class SpatialGraph:
             Y=Y,
             N=N,
             E=E_count,
+            avg_degree=per_node_avg,
         )
 
     @staticmethod
@@ -160,6 +180,7 @@ class SpatialGraph:
             Y=torch.empty(0, num_sh, device=device),
             N=N,
             E=0,
+            avg_degree=torch.ones(N, device=device),  # safe: no edges → /1
         )
 
     @staticmethod
@@ -169,6 +190,7 @@ class SpatialGraph:
         pos: Tensor,
         N: int,
         max_l: int = 2,
+        batch: Optional[Tensor] = None,
     ) -> SpatialGraph:
         """Build SpatialGraph from pre-computed edge indices.
 
@@ -181,6 +203,7 @@ class SpatialGraph:
             pos: [N, 3] — point positions
             N: Number of nodes
             max_l: Maximum SH degree
+            batch: [N] int64 — batch assignment (optional, for per-cloud avg)
 
         Returns:
             SpatialGraph
@@ -195,10 +218,27 @@ class SpatialGraph:
         Y = spherical_harmonics(direction, max_l=max_l, normalize=False)
         col_sorted, perm, node_start, node_end = sort_and_build_csr(col, N)
 
+        # Per-cloud average degree (same logic as build())
+        degree = (node_end - node_start).float()
+        if batch is not None:
+            B_count = int(batch.max().item()) + 1
+            cloud_sum = torch.zeros(B_count, device=device)
+            cloud_cnt = torch.zeros(B_count, device=device)
+            cloud_sum.scatter_add_(0, batch, degree)
+            cloud_cnt.scatter_add_(0, batch, torch.ones_like(degree))
+            cloud_avg = cloud_sum / cloud_cnt.clamp(min=1)
+            per_node_avg = cloud_avg[batch]
+        else:
+            per_node_avg = degree.mean().expand(N)
+        per_node_avg = per_node_avg.clamp(min=1.0)
+
         return SpatialGraph(
             row=row, col=col,
             direction=direction, dist=dist,
             col_sorted=col_sorted, perm=perm,
             node_start=node_start, node_end=node_end,
             Y=Y, N=N, E=E_count,
+            avg_degree=per_node_avg,
         )
+
+

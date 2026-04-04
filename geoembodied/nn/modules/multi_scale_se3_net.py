@@ -213,7 +213,7 @@ class _EncoderStage(nn.Module):
                 row = unique_edges // N
                 col = unique_edges % N
 
-        return SpatialGraph.from_edge_index(row, col, pos, N)
+        return SpatialGraph.from_edge_index(row, col, pos, N, batch=batch)
 
     def forward(
         self,

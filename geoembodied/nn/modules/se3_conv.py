@@ -532,19 +532,23 @@ class SE3Conv(nn.Module):
                     graph.node_start, graph.node_end, N,
                 )
 
-            # ── 4b. Batch-average degree normalization ──
+            # ── 4b. Per-cloud degree normalization (batch-isolation safe) ──
             # segment_reduce uses SUM. In multi-scale architectures,
             # deeper stages have fewer points → each node has more
             # neighbors within radius → SUM grows with depth.
             #
             # MACE divides by a global avg_num_neighbors constant.
-            # We use per-batch-average degree: same divisor for all
-            # nodes within a conv call, so within-stage density
-            # variation (boundary vs interior) is preserved.
-            # This is a HARD divisor (not learnable).
-            degree = (graph.node_end - graph.node_start).float()
-            avg_degree = degree.clamp(min=1).mean()
-            all_out = all_out / avg_degree
+            # We use per-cloud average degree: each node is divided by
+            # the mean degree of its own cloud.  This ensures identical
+            # output whether a cloud is processed alone or in a batch.
+            if graph.avg_degree is not None:
+                # [N] per-node divisor (same value for all nodes in one cloud)
+                all_out = all_out / graph.avg_degree.unsqueeze(1)
+            else:
+                # Fallback: batch-wide mean (backward compat for old graphs)
+                degree = (graph.node_end - graph.node_start).float()
+                avg_degree = degree.clamp(min=1).mean()
+                all_out = all_out / avg_degree
 
             Cs = self.out_scalar_channels
             if total_type2_msg is not None:
