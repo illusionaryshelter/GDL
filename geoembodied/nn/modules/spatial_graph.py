@@ -137,8 +137,11 @@ class SpatialGraph:
         #    processed alone or in a batch.  shape: [N]
         degree = (node_end - node_start).float()  # [N]
         if batch is not None:
-            # scatter_mean: per‑cloud average, then broadcast back
-            B_count = int(batch.max().item()) + 1
+            # Use num_batch_elements to avoid GPU→CPU sync
+            if num_batch_elements is not None:
+                B_count = num_batch_elements
+            else:
+                B_count = int(batch.max().item()) + 1
             cloud_sum = torch.zeros(B_count, device=device)
             cloud_cnt = torch.zeros(B_count, device=device)
             cloud_sum.scatter_add_(0, batch, degree)
@@ -191,6 +194,7 @@ class SpatialGraph:
         N: int,
         max_l: int = 2,
         batch: Optional[Tensor] = None,
+        num_batch_elements: Optional[int] = None,
     ) -> SpatialGraph:
         """Build SpatialGraph from pre-computed edge indices.
 
@@ -204,6 +208,7 @@ class SpatialGraph:
             N: Number of nodes
             max_l: Maximum SH degree
             batch: [N] int64 — batch assignment (optional, for per-cloud avg)
+            num_batch_elements: Number of clouds (avoids GPU sync if provided)
 
         Returns:
             SpatialGraph
@@ -221,7 +226,10 @@ class SpatialGraph:
         # Per-cloud average degree (same logic as build())
         degree = (node_end - node_start).float()
         if batch is not None:
-            B_count = int(batch.max().item()) + 1
+            if num_batch_elements is not None:
+                B_count = num_batch_elements
+            else:
+                B_count = int(batch.max().item()) + 1
             cloud_sum = torch.zeros(B_count, device=device)
             cloud_cnt = torch.zeros(B_count, device=device)
             cloud_sum.scatter_add_(0, batch, degree)
