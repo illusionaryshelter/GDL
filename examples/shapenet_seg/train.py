@@ -624,6 +624,22 @@ def main() -> None:
         if pool_unis:
             diag_log += f" [{','.join(pool_unis)}]"
 
+        # ── Skip scale diagnostics (per-block learnable residual) ──
+        skip_parts = []
+        bb = model.backbone
+        for si in range(bb.num_stages):
+            for bi, blk in enumerate(bb.encoder_stages[si].blocks):
+                d = blk.get_skip_diagnostics()
+                if d:
+                    tag = f'e{si}b{bi}'
+                    skip_parts.append(
+                        f'{tag}[s={d["skip_s_mean"]:.3f}'
+                        f',v={d.get("skip_v_mean", 0):.3f}'
+                        f',t2={d.get("skip_t2_mean", 0):.3f}]'
+                    )
+        if skip_parts:
+            diag_log += '\n  ├─ skip: ' + ' '.join(skip_parts)
+
         if scaler_scale > 0:
             diag_log += f" | amp_scale={scaler_scale:.0f}"
 

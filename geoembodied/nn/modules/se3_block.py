@@ -3,12 +3,23 @@
 
 """SE(3)-equivariant interaction block.
 
-Single interaction layer: Conv → Norm → Gate → [SelfTP] → Scaled Residual.
+Single interaction layer: Conv → Norm → Gate → [SelfTP] → Learnable Skip Residual.
 
 Supports scalar (l=0), vector (l=1), and type-2 (l=2) features.
 
-Post-Norm is REQUIRED for equivariant GNNs (NequIP/MACE/Allegro standard).
-Residual scaling by 1/√2 prevents linear norm growth.
+**Residual design (MACE/NequIP pattern):**
+    output = conv_branch(x) + skip_scale * x
+
+    Unlike the naive ``(f(x) + x) / √2``, the skip contribution is
+    controlled by **per-channel learnable scale parameters** initialised
+    to ``1/√2``.  This gives the optimiser a "knob" to damp the skip
+    path if features begin to diverge — exactly matching the
+    FullyConnectedTensorProduct skip used in MACE (NeurIPS 2022) and
+    the self-connection Linear in NequIP (Nature Comm. 2022).
+
+    The conv branch is NOT scaled (receives full gradient), so its
+    initial influence is √2× larger than the old scheme, compensating
+    the "pure residual" degeneration previously observed.
 
 Self-Interaction TP (optional, use_self_tp=True):
     - v·v → scalar (ν=2 body order)
@@ -18,7 +29,7 @@ Self-Interaction TP (optional, use_self_tp=True):
 from __future__ import annotations
 
 import math
-from typing import Optional, TYPE_CHECKING
+from typing import Dict, Optional, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -31,6 +42,11 @@ from geoembodied.nn.modules.gated_nonlinearity import GatedNonlinearity
 if TYPE_CHECKING:
     from geoembodied.nn.modules.spatial_graph import SpatialGraph
 
+# Default initial value for learnable skip scales.
+# 1/√2 ≈ 0.7071 — matches the old fixed residual scaling so that
+# behaviour at initialisation is unchanged.
+_SKIP_INIT = 1.0 / math.sqrt(2.0)
+
 
 class SE3NetBlock(nn.Module):
     """Single SE(3)-equivariant interaction block.
@@ -41,9 +57,14 @@ class SE3NetBlock(nn.Module):
                                                                │
                                                     [+ SelfTP: v·v, t2·t2 → s]
                                                                │
-                                                     [+ skip] × 1/√2
+                                                     [+ skip_scale · input]
                                                                │
                                                           (s_out, v_out, [t2_out])
+
+    The ``skip_*_scale`` parameters are **per-channel, per-block**
+    (NOT shared across modules).  For l≥1 features the scale is a
+    simple channel-wise scalar multiplication, which is SO(3)-equivariant:
+    ``γ_c · D^l(R) f_{c} = D^l(R) (γ_c · f_{c})``.
 
     Args:
         channels_scalar: Scalar feature channels (in = out)
@@ -74,8 +95,6 @@ class SE3NetBlock(nn.Module):
         self.use_residual = use_residual
         self.use_self_tp = use_self_tp
 
-        self._rsqrt2 = 1.0 / math.sqrt(2.0)
-
         self.conv = SE3Conv(
             in_scalar_channels=channels_scalar,
             in_vector_channels=channels_vector,
@@ -100,6 +119,31 @@ class SE3NetBlock(nn.Module):
             gate_mode=gate_mode,
         )
 
+        # ── Learnable skip projections (MACE/NequIP pattern) ──
+        # Per-channel scale, initialised to 1/√2.
+        # Each block owns its own parameters — no cross-module sharing.
+        if use_residual:
+            self.skip_s_scale = nn.Parameter(
+                torch.full((channels_scalar,), _SKIP_INIT)
+            )
+            if channels_vector > 0:
+                self.skip_v_scale = nn.Parameter(
+                    torch.full((channels_vector,), _SKIP_INIT)
+                )
+            else:
+                self.register_parameter('skip_v_scale', None)
+
+            if channels_type2 > 0:
+                self.skip_t2_scale = nn.Parameter(
+                    torch.full((channels_type2,), _SKIP_INIT)
+                )
+            else:
+                self.register_parameter('skip_t2_scale', None)
+        else:
+            self.register_parameter('skip_s_scale', None)
+            self.register_parameter('skip_v_scale', None)
+            self.register_parameter('skip_t2_scale', None)
+
         # Self-Interaction TP: v·v + t2·t2 → scalar
         self_tp_input_dim = 0
         if use_self_tp and channels_vector > 0:
@@ -120,7 +164,7 @@ class SE3NetBlock(nn.Module):
         graph: 'SpatialGraph',
         type2: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
-        """Forward pass: Conv → Norm → Gate → [SelfTP] → Scaled Residual.
+        """Forward pass: Conv → Norm → Gate → [SelfTP] → Learnable Skip.
 
         Args:
             scalars: [N, channels_scalar], representation: SO(3) type-0
@@ -167,23 +211,58 @@ class SE3NetBlock(nn.Module):
                 s_tp = self.self_tp_proj(tp_cat) * self.self_tp_scale
                 s_new = s_new + s_tp
 
-        # Residual
+        # ── Learnable skip residual ──
+        # output = conv_branch + skip_scale * input
+        # skip_scale is per-channel, per-block, learnable.
+        # Equivariance: scalar multiplication on each channel is SO(3)-invariant.
         if self.use_residual:
-            s_new = (s_new + scalars) * self._rsqrt2
-            v_new = (v_new + vectors) * self._rsqrt2
-            if t2_new is not None and type2 is not None:
-                t2_new = (t2_new + type2) * self._rsqrt2
+            # l=0: per-channel scale, shape [C_s]
+            s_new = s_new + scalars * self.skip_s_scale
+
+            # l=1: per-channel scale, shape [C_v, 1] broadcast over xyz
+            if self.skip_v_scale is not None:
+                v_new = v_new + vectors * self.skip_v_scale.unsqueeze(-1)
+
+            # l=2: per-channel scale, shape [C_t2, 1] broadcast over 5 components
+            if t2_new is not None and type2 is not None and self.skip_t2_scale is not None:
+                t2_new = t2_new + type2 * self.skip_t2_scale.unsqueeze(-1)
 
         if has_type2 and t2_new is not None:
             return s_new, v_new, t2_new
         return s_new, v_new
 
+    def get_skip_diagnostics(self) -> Dict[str, float]:
+        """Return skip scale statistics for training diagnostics.
+
+        Returns:
+            Dictionary with per-type skip scale mean/std/min/max.
+        """
+        diag: Dict[str, float] = {}
+        if self.skip_s_scale is not None:
+            s = self.skip_s_scale.detach()
+            diag['skip_s_mean'] = s.mean().item()
+            diag['skip_s_std'] = s.std().item()
+            diag['skip_s_min'] = s.min().item()
+            diag['skip_s_max'] = s.max().item()
+        if self.skip_v_scale is not None:
+            v = self.skip_v_scale.detach()
+            diag['skip_v_mean'] = v.mean().item()
+            diag['skip_v_std'] = v.std().item()
+        if self.skip_t2_scale is not None:
+            t = self.skip_t2_scale.detach()
+            diag['skip_t2_mean'] = t.mean().item()
+            diag['skip_t2_std'] = t.std().item()
+        return diag
+
     def extra_repr(self) -> str:
-        return (
-            f"scalar={self.channels_scalar}, "
-            f"vector={self.channels_vector}, "
-            f"type2={self.channels_type2}, "
-            f"residual={self.use_residual}, "
-            f"gate_mode={self.gate.gate_mode}, "
-            f"self_tp={self.use_self_tp}"
-        )
+        parts = [
+            f"scalar={self.channels_scalar}",
+            f"vector={self.channels_vector}",
+            f"type2={self.channels_type2}",
+            f"residual={self.use_residual}",
+            f"gate_mode={self.gate.gate_mode}",
+            f"self_tp={self.use_self_tp}",
+        ]
+        if self.skip_s_scale is not None:
+            parts.append(f"skip_init={_SKIP_INIT:.4f}")
+        return ", ".join(parts)

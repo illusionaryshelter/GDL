@@ -117,12 +117,14 @@ class NormTracer:
                     s = s + blk.self_tp_proj(
                         torch.cat(tp_in, -1)) * blk.self_tp_scale
 
-            # Residual + 1/√2 scaling
+            # Learnable skip residual
             if blk.use_residual:
-                s = (s + scalars) * blk._rsqrt2
-                v = (v + vectors) * blk._rsqrt2
-                if t2 is not None and type2 is not None:
-                    t2 = (t2 + type2) * blk._rsqrt2
+                s = s + scalars * blk.skip_s_scale
+                if blk.skip_v_scale is not None:
+                    v = v + vectors * blk.skip_v_scale.unsqueeze(-1)
+                if (t2 is not None and type2 is not None
+                        and blk.skip_t2_scale is not None):
+                    t2 = t2 + type2 * blk.skip_t2_scale.unsqueeze(-1)
             tr[f'{p}_out'].append(s.detach().norm(dim=-1).mean().item())
 
             if has_t2 and t2 is not None:
@@ -277,6 +279,23 @@ def main():
         for v in vals:
             row += f'{v:10.3f}'
         row += f' | {avg_loss:.3f} {avg_acc:.3f} {ratio:.3f}  {dt:.0f}s'
+
+        # ── Skip scale diagnostics ──
+        skip_parts = []
+        bb = model.backbone
+        for si in range(bb.num_stages):
+            for bi, blk in enumerate(bb.encoder_stages[si].blocks):
+                d = blk.get_skip_diagnostics()
+                if d:
+                    tag = f'e{si}b{bi}'
+                    skip_parts.append(
+                        f'{tag}[s={d["skip_s_mean"]:.3f}'
+                        f',v={d.get("skip_v_mean", 0):.3f}'
+                        f',t2={d.get("skip_t2_mean", 0):.3f}]'
+                    )
+        if skip_parts:
+            row += '\n  ├─ skip: ' + ' '.join(skip_parts)
+
         print(row)
 
     print()
@@ -284,6 +303,7 @@ def main():
     print('KEY:  s2/s0 < 1.5 = healthy.  Growing = s2 norm explosion.')
     print('      e*_conv = raw conv output after degree norm.')
     print('      e*_gate = after LayerNorm + gate (should be ~5-10).')
+    print('      skip: learnable skip scale (init=0.707, smaller=less residual).')
     print('=' * 120)
 
 
