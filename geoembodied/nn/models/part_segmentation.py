@@ -418,6 +418,9 @@ class SE3PartSegNet(nn.Module):
             for i, enc_s in enumerate(enc_s_list):
                 diag[f'enc{i}_s_norm'] = enc_s.norm(dim=-1).mean().item()
 
+            # Decoder output scalar norm (post-final_norm)
+            diag['s_out_norm'] = s_out.norm(dim=-1).mean().item()
+
             # Type-2 diagnostics
             if t2_out is not None:
                 t2_norms = t2_out.norm(dim=-1).mean(dim=-1)  # [N]

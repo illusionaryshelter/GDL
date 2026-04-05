@@ -472,9 +472,9 @@ class MultiScaleSE3Net(nn.Module):
                     s, v, cur_pos, cur_ptr, cur_batch
                 )
 
-            enc_s_list.append(s)
-            enc_v_list.append(v)
-            enc_t2_list.append(t2 if has_t2 else None)
+            enc_s_list.append(s.clone())  # clone: bottleneck in-place op would alias
+            enc_v_list.append(v.clone())
+            enc_t2_list.append(t2.clone() if has_t2 and t2 is not None else None)
             enc_pos_list.append(cur_pos)
             enc_ptr_list.append(cur_ptr)
             enc_batch_list.append(cur_batch)
@@ -511,11 +511,14 @@ class MultiScaleSE3Net(nn.Module):
 
             s_padded = self.bottleneck_attn(s_padded, pos_padded, mask=mask_padded)
 
+            # Avoid in-place mutation of s (which aliases enc_s_list[-1])
+            s_new = s.clone()
             for b_idx in range(B_bn):
                 start = cur_ptr[b_idx].item()
                 end = cur_ptr[b_idx + 1].item()
                 n_b = end - start
-                s[start:end] = s_padded[b_idx, :n_b]
+                s_new[start:end] = s_padded[b_idx, :n_b]
+            s = s_new
 
         # ── Decoder ──
         for i in range(self.num_stages - 2, -1, -1):

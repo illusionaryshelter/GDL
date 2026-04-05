@@ -581,12 +581,15 @@ def main() -> None:
                     f"attn: entropy={attn_ent:.3f} max={attn_max:.3f} "
                     f"uniform={attn_uni:.2f}")
 
-        # Per-stage encoder scalar norms (multi-scale health)
+        # Per-stage encoder scalar norms + decoder output (multi-scale health)
         enc_norms = []
         for i in range(args.num_stages):
             key = f'enc{i}_s_norm'
             if key in diag:
                 enc_norms.append(f"s{i}={diag[key]:.3f}")
+        s_out_n = diag.get('s_out_norm', None)
+        if s_out_n is not None:
+            enc_norms.append(f"s_out={s_out_n:.3f}")
         if enc_norms:
             diag_log += f" | enc:[{','.join(enc_norms)}]"
 
