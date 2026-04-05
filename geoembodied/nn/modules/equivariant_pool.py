@@ -327,25 +327,30 @@ class EquivariantPool(nn.Module):
             cos_d_vi = d_vi_dot / (seed_v_norms.unsqueeze(1) + eps)  # [N_out, K, C_v]
             cos_d_vi_mean = cos_d_vi.mean(dim=-1)                  # [N_out, K]
 
-            # Feature 5: relative vector magnitude difference
+            # Feature 5(+6): vector magnitude features
             nbr_v_norm_mean = nbr_v_norms.mean(dim=-1)             # [N_out, K]
             seed_v_norm_mean = seed_v_norms.mean(dim=-1, keepdim=True)  # [N_out, 1]
-            # ‖v_nbr‖ - ‖v_seed‖: positive when neighbor has stronger
-            # vector features, negative when weaker. Unlike the removed
-            # ‖v_seed‖ (which was constant across K neighbors → dead
-            # feature in NeighborNorm), this difference HAS intra-seed
-            # variance proportional to how neighbor magnitudes differ.
-            v_norm_diff = nbr_v_norm_mean - seed_v_norm_mean        # [N_out, K]
 
-            # Stack invariant features: [N_out, K, 6 or 7]
+            # Stack invariant features
             feat_list = [
                 dist,              # ≥0, physical scale
                 scalar_ratio,      # ~1.0, relative
                 cos_vi_vj_mean,    # [-1, 1], angular
                 cos_d_vj_mean,     # [-1, 1], angular
                 cos_d_vi_mean,     # [-1, 1], angular
-                v_norm_diff,       # ℝ, relative magnitude
             ]
+
+            # Auto-adapt: old checkpoints have n_inv=7(+1 t2)=8 with
+            # v_nbr+v_seed; new code uses n_inv=6(+1 t2)=7 with v_norm_diff.
+            n_base = self.attn_feat_norm.n_features - (1 if self.type2_channels > 0 else 0)
+            if n_base >= 7:
+                # Legacy: separate v_nbr and v_seed (v_seed is dead but
+                # needed for old checkpoint weight compatibility)
+                feat_list.append(nbr_v_norm_mean)
+                feat_list.append(seed_v_norm_mean.expand(-1, K))
+            else:
+                # New: relative difference (has intra-seed variance)
+                feat_list.append(nbr_v_norm_mean - seed_v_norm_mean)
 
             # Type-2 invariant feature
             if type2 is not None and self.type2_channels > 0:
