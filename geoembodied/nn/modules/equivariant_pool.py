@@ -348,8 +348,9 @@ class EquivariantPool(nn.Module):
             if type2 is not None and self.type2_channels > 0:
                 type2_f = type2.to(compute_dtype)
                 nbr_t2 = type2_f[safe_idx]  # [N_out, K, C_t2, 5]
-                # ||t2||: invariant per-channel norm, averaged
-                nbr_t2_norm_mean = nbr_t2.pow(2).sum(dim=-1).sqrt().mean(dim=-1)  # [N_out, K]
+                # ||t2||: invariant per-channel norm, averaged.
+                # clamp before sqrt: backward of sqrt(0) = 0.5/sqrt(0) = NaN (Rule 4)
+                nbr_t2_norm_mean = nbr_t2.pow(2).sum(dim=-1).clamp(min=1e-12).sqrt().mean(dim=-1)  # [N_out, K]
                 feat_list.append(nbr_t2_norm_mean)
 
             attn_input = torch.stack(feat_list, dim=-1)
@@ -418,12 +419,46 @@ class EquivariantPool(nn.Module):
             nbr_vectors = vectors[safe_idx]  # [N_out, K, C_v, 3]
             v_out = (w.unsqueeze(-1).unsqueeze(-1) * nbr_vectors).sum(dim=1)
 
+            # ── Norm-preserving rescaling for vectors (l=1) ──
+            # Weighted average of multi-dim features causes directional
+            # cancellation (50–73% norm loss). Fix: rescale so ||v_out||
+            # matches the weighted average of input norms (no cancellation
+            # since norms are positive scalars).
+            #
+            # Equivariance: target and actual are SO(3)-invariant (norms).
+            #   scale = target/actual is a per-channel scalar.
+            #   ρ(g)(α·v) = α·ρ(g)v  ✓
+            #
+            # v_out: [N_out, C_v, 3], representation: SO(3) type-1
+            _eps = 1e-12
+            nbr_v_norms = (nbr_vectors ** 2).sum(-1).clamp(min=_eps).sqrt()
+            target_v = (w.unsqueeze(-1) * nbr_v_norms).sum(dim=1)  # [N_out, C_v]
+            actual_v = (v_out ** 2).sum(-1).clamp(min=_eps).sqrt()  # [N_out, C_v]
+            scale_v = torch.where(
+                target_v > 1e-7,
+                target_v / actual_v.clamp(min=1e-8),
+                torch.ones_like(target_v),
+            )
+            v_out = v_out * scale_v.unsqueeze(-1)
+
             # Type-2 aggregation: [N_out, K, C_t2, 5] weighted sum → [N_out, C_t2, 5]
             t2_out = None
             if type2 is not None and self.type2_channels > 0:
                 type2_f = type2.to(compute_dtype)
                 nbr_t2_all = type2_f[safe_idx]  # [N_out, K, C_t2, 5]
                 t2_out = (w.unsqueeze(-1).unsqueeze(-1) * nbr_t2_all).sum(dim=1)
+
+                # ── Norm-preserving rescaling for type-2 (l=2) ──
+                # t2_out: [N_out, C_t2, 5], representation: SO(3) type-2
+                nbr_t2_norms = (nbr_t2_all ** 2).sum(-1).clamp(min=_eps).sqrt()
+                target_t2 = (w.unsqueeze(-1) * nbr_t2_norms).sum(dim=1)
+                actual_t2 = (t2_out ** 2).sum(-1).clamp(min=_eps).sqrt()
+                scale_t2 = torch.where(
+                    target_t2 > 1e-7,
+                    target_t2 / actual_t2.clamp(min=1e-8),
+                    torch.ones_like(target_t2),
+                )
+                t2_out = t2_out * scale_t2.unsqueeze(-1)
 
             # Zero out features from invalid neighbors
             all_invalid = ~valid_mask.any(dim=1)  # [N_out]

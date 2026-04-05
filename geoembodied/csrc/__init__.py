@@ -472,7 +472,15 @@ def _knn_bruteforce(
         s = source[s_start:s_end]    # [n_s, 3]
 
         # Pairwise squared distances: [n_q, n_s]
-        dist = torch.cdist(q.float(), s.float(), p=2.0).pow(2)
+        # IMPORTANT: compute squared L2 directly, NOT via cdist(p=2).pow(2).
+        # cdist(p=2) computes sqrt(Σ(xi-yi)²) internally, then .pow(2)
+        # squares it back — this sqrt→square round-trip introduces ~1e-6
+        # asymmetric FP error between original and rotated coordinates,
+        # which gets amplified to ~1e-3 after downstream sqrt in pool.
+        q_f = q.float().unsqueeze(1)   # [n_q, 1, 3]
+        s_f = s.float().unsqueeze(0)   # [1, n_s, 3]
+        diff = q_f - s_f               # [n_q, n_s, 3]
+        dist = (diff * diff).sum(-1)   # [n_q, n_s]
 
         k_actual = min(k, dist.shape[1])
         topk_dists, topk_local = dist.topk(k_actual, dim=1, largest=False)
