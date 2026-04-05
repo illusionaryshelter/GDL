@@ -1,45 +1,35 @@
 #!/usr/bin/env python3
-"""Trace s/v/t2 norms through every layer — verify pooling cancellation.
+"""Fast training trace: t2 pooling cancellation + augmentation effect.
 
-Hooks every encoder block and pool layer to trace per-type feature norms.
-Verifies the hypothesis: attention-weighted pooling causes type-2 (and
-vector) norm collapse via 5D/3D component cancellation, while scalars
-are preserved.
+Like trace_norms.py but focused on:
+  1. s/v/t2 norms at every pool layer (cancellation ratio)
+  2. Projection weight norms (t2_pw, v_pw) over training
+  3. head_t2_ratio evolution
+  4. Comparison: augment ON vs OFF (run twice)
 
-Outputs a table like:
+Uses REAL ShapeNet data, PRODUCTION model size, limited batches.
 
-  Layer       |   s_norm |   v_norm |  t2_norm | v_drop% | t2_drop%
-  ────────────+──────────+──────────+──────────+---------+---------
-  Enc0b0      |    9.71  |    2.48  |    1.08  |         |
-  Enc0b1      |    8.08  |    2.11  |    1.32  |         |
-  Pool0       |    7.67  |    0.56  |    0.47  |  -73.5% |  -64.4%
-  ...
-
-Also reports:
-  - t2_inv_proj / v_inv_proj weight norms (weight decay diagnostic)
-  - Head column norms per feature group
-  - Per-channel t2 norms at each layer (identifies dead channels)
-
-Usage:
-    # From checkpoint (no data needed, uses random input):
+Usage (remote):
+    # Default: 5 batches/epoch, 20 epochs, augmentation ON
     python examples/shapenet_seg/trace_t2_pool.py \\
-        --ckpt examples/shapenet_seg/shapenet_best.pt
+        --data_root ../data/shapenetpart_hdf5_2048
 
-    # With real data:
+    # Without augmentation (compare with above):
     python examples/shapenet_seg/trace_t2_pool.py \\
-        --ckpt examples/shapenet_seg/shapenet_best.pt \\
+        --data_root ../data/shapenetpart_hdf5_2048 --no_augment
+
+    # Lighter run:
+    python examples/shapenet_seg/trace_t2_pool.py \\
         --data_root ../data/shapenetpart_hdf5_2048 \\
-        --num_batches 3
-
-    # From scratch (random init, shows baseline cancellation):
-    python examples/shapenet_seg/trace_t2_pool.py --from_scratch
+        --epochs 10 --batches 2
 """
 
 import argparse
 import os
 import sys
-from collections import OrderedDict
-from typing import Dict, List, Optional, Tuple
+import time
+from collections import defaultdict
+from typing import Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
@@ -47,24 +37,30 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.data import DataLoader
 
+from examples.shapenet_seg.dataset import (
+    ShapeNetPartDataset, collate_fn,
+)
 from examples.shapenet_seg.model import SE3PartSegNet
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Hook infrastructure: traces s/v/t2 norms through every layer
+# Hook infrastructure: traces s/v/t2 at blocks AND pools
 # ═══════════════════════════════════════════════════════════════════
 
-class SVT2Tracer:
-    """Trace scalar / vector / type-2 norms at every stage of the backbone.
+class PoolCancelTracer:
+    """Hooks every block and pool to trace s/v/t2 norms during training.
 
-    Hooks block.forward to capture norms AFTER each sub-operation.
-    Hooks pool.forward to capture the norm drop across pooling.
+    Key difference from trace_norms.py NormTracer:
+      - Tracks v and t2 norms, not just scalar s
+      - Records pool pre/post norms to compute cancellation %
+      - Tracks projection weight norms and head contribution ratio
     """
 
     def __init__(self, model: SE3PartSegNet):
         self.model = model
-        self.records: List[Dict[str, float]] = []
+        self.trace: Dict[str, List[float]] = defaultdict(list)
         self._installed = False
 
     def install(self) -> None:
@@ -79,34 +75,20 @@ class SVT2Tracer:
         self._installed = True
 
     def reset(self) -> None:
-        self.records.clear()
+        self.trace.clear()
 
-    def _record(self, name: str, s: Tensor, v: Tensor,
-                t2: Optional[Tensor]) -> None:
-        """Record norms for a named location in the network."""
-        rec = {
-            'name': name,
-            's_norm': s.detach().norm(dim=-1).mean().item(),
-            'v_norm': v.detach().norm(dim=-1).mean().item(),
-            'N': s.shape[0],
-        }
-        if t2 is not None:
-            # Per-channel norms: shape [N, C_t2]
-            t2_ch_norms = t2.detach().norm(dim=-1)  # [N, C_t2]
-            rec['t2_norm'] = t2_ch_norms.mean().item()
-            rec['t2_ch_norms'] = t2_ch_norms.mean(0).tolist()  # per channel
-        else:
-            rec['t2_norm'] = 0.0
-            rec['t2_ch_norms'] = []
-        self.records.append(rec)
+    def means(self) -> Dict[str, float]:
+        return {k: sum(v) / len(v) if v else 0.0
+                for k, v in self.trace.items()}
+
+    # ── Block hook: captures s/v/t2 after output norm ──
 
     def _hook_block(self, si: int, bi: int, blk) -> None:
-        """Replace block.forward with a traced version."""
-        tracer = self
+        tr = self.trace
 
-        def traced_forward(scalars, vectors, graph, type2=None):
+        def fwd(scalars, vectors, graph, type2=None):
             has_t2 = type2 is not None and blk.channels_type2 > 0
-            name = f'Enc{si}b{bi}'
+            p = f'e{si}b{bi}'
 
             # Conv
             if has_t2:
@@ -153,183 +135,62 @@ class SVT2Tracer:
             else:
                 s, v = blk.output_norm(s, v)
 
-            tracer._record(name, s, v, t2)
+            # Record norms
+            tr[f'{p}_s'].append(s.detach().norm(dim=-1).mean().item())
+            tr[f'{p}_v'].append(v.detach().norm(dim=-1).mean().item())
+            if t2 is not None:
+                tr[f'{p}_t2'].append(
+                    t2.detach().norm(dim=-1).mean().item())
 
             if has_t2 and t2 is not None:
                 return s, v, t2
             return s, v
 
-        blk.forward = traced_forward
+        blk.forward = fwd
+
+    # ── Pool hook: captures pre/post to compute cancellation ──
 
     def _hook_pool(self, idx: int, pool) -> None:
-        """Wrap pool.forward to record pre/post norms."""
-        tracer = self
         orig_fwd = pool.forward
+        tr = self.trace
 
-        def traced_fwd(*a, **kw):
-            # pre-pool: a = (pos, scalars, vectors, ptr, type2=...)
+        def fwd(*a, **kw):
+            # Pre-pool norms
             s_in, v_in = a[1], a[2]
             t2_in = kw.get('type2', None)
-            tracer._record(f'Pool{idx}_pre', s_in, v_in, t2_in)
+            tr[f'p{idx}_s_pre'].append(
+                s_in.detach().norm(dim=-1).mean().item())
+            tr[f'p{idx}_v_pre'].append(
+                v_in.detach().norm(dim=-1).mean().item())
+            if t2_in is not None:
+                tr[f'p{idx}_t2_pre'].append(
+                    t2_in.detach().norm(dim=-1).mean().item())
 
             result = orig_fwd(*a, **kw)
 
-            # result = (pos, s_out, v_out, t2_out, ptr_out, fps_idx)
-            # or (pos, s_out, v_out, ptr_out, fps_idx) if no t2
+            # Post-pool norms
             s_out, v_out = result[1], result[2]
-            # Detect t2_out from result length
-            if len(result) >= 6:
-                t2_out = result[3]
-            else:
-                t2_out = None
-            tracer._record(f'Pool{idx}', s_out, v_out, t2_out)
+            tr[f'p{idx}_s_post'].append(
+                s_out.detach().norm(dim=-1).mean().item())
+            tr[f'p{idx}_v_post'].append(
+                v_out.detach().norm(dim=-1).mean().item())
+            if len(result) >= 6 and result[3] is not None:
+                tr[f'p{idx}_t2_post'].append(
+                    result[3].detach().norm(dim=-1).mean().item())
 
             return result
 
-        pool.forward = traced_fwd
+        pool.forward = fwd
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Reporting
-# ═══════════════════════════════════════════════════════════════════
-
-def print_trace(tracer: SVT2Tracer) -> None:
-    """Print the trace table with cancellation ratios."""
-    recs = tracer.records
-
-    # Header
-    print()
-    print('═' * 90)
-    print('  FEATURE NORM TRACE: s / v / t2 through backbone')
-    print('═' * 90)
-    hdr = (f'  {"Layer":<14}│{"N":>6} │ {"s_norm":>8} │ '
-           f'{"v_norm":>8} │ {"t2_norm":>8} │ '
-           f'{"v_Δ%":>7} │ {"t2_Δ%":>7} │ '
-           f'{"s_Δ%":>7}')
-    print(hdr)
-    print('  ' + '─' * 86)
-
-    prev_s, prev_v, prev_t2 = None, None, None
-
-    for rec in recs:
-        name = rec['name']
-        s, v, t2 = rec['s_norm'], rec['v_norm'], rec['t2_norm']
-        N = rec['N']
-
-        # Compute drops
-        def pct(cur: float, prev_val: Optional[float]) -> str:
-            if prev_val is None or prev_val < 1e-6:
-                return '       '
-            change = (cur - prev_val) / prev_val * 100
-            if abs(change) < 1:
-                return '       '
-            sym = '▼' if change < 0 else '▲'
-            return f'{change:+5.1f}%{sym}'
-
-        # Only show drops at pool layers (where cancellation happens)
-        is_pool = 'Pool' in name and '_pre' not in name
-        if is_pool:
-            v_drop = pct(v, prev_v)
-            t2_drop = pct(t2, prev_t2)
-            s_drop = pct(s, prev_s)
-        else:
-            v_drop = t2_drop = s_drop = '       '
-
-        row = (f'  {name:<14}│{N:>6} │ {s:>8.3f} │ '
-               f'{v:>8.4f} │ {t2:>8.4f} │ '
-               f'{v_drop:>7} │ {t2_drop:>7} │ {s_drop:>7}')
-
-        # Highlight pool lines
-        if is_pool:
-            row = f'\033[93m{row}\033[0m'  # yellow
-
-        print(row)
-
-        prev_s, prev_v, prev_t2 = s, v, t2
-
-    print()
-
-    # Per-channel t2 norms at key points
-    print('  t2 per-channel norms (identifies dead channels):')
-    for rec in recs:
-        ch = rec.get('t2_ch_norms', [])
-        if ch:
-            name = rec['name']
-            min_ch = min(ch) if ch else 0
-            max_ch = max(ch) if ch else 0
-            ch_str = ' '.join(f'{c:.3f}' for c in ch)
-            dead = sum(1 for c in ch if c < 0.01)
-            print(f'    {name:<14}: [{ch_str}]  '
-                  f'range=[{min_ch:.4f}, {max_ch:.4f}]  '
-                  f'dead={dead}/{len(ch)}')
-    print()
-
-
-def print_weight_diagnostics(model: SE3PartSegNet) -> None:
-    """Print projection weight norms and head column analysis."""
-    print('═' * 90)
-    print('  PROJECTION WEIGHT DIAGNOSTICS')
-    print('═' * 90)
-
-    # Projection weights
+def get_weight_diag(model: SE3PartSegNet) -> Dict[str, float]:
+    """Snapshot of projection weight norms (no grad needed)."""
+    d: Dict[str, float] = {}
     if hasattr(model, 't2_inv_proj'):
-        t2_w = model.t2_inv_proj.weight
-        print(f'  t2_inv_proj: shape={list(t2_w.shape)}  '
-              f'||W||={t2_w.norm():.4f}  std={t2_w.std():.4f}')
+        d['t2_pw'] = model.t2_inv_proj.weight.norm().item()
     if hasattr(model, 'v_inv_proj'):
-        v_w = model.v_inv_proj.weight
-        print(f'  v_inv_proj:  shape={list(v_w.shape)}  '
-              f'||W||={v_w.norm():.4f}  std={v_w.std():.4f}')
-    if hasattr(model, 't2_inv_proj') and hasattr(model, 'v_inv_proj'):
-        ratio = model.t2_inv_proj.weight.norm() / model.v_inv_proj.weight.norm()
-        print(f'  Ratio t2/v: {ratio:.4f}  '
-              f'{"(OK)" if ratio > 0.5 else "(⚠ t2 proj shrinking!)"}')
-    print()
-
-    # Head first-layer column norms
-    if hasattr(model, 'head') and len(model.head) > 0:
-        head_w = model.head[0].weight  # [out, in]
-        in_dim = head_w.shape[1]
-        hs = model.hidden_scalar
-        hv = hs // 2 if hasattr(model, 'v_inv_proj') else 0
-        ht2 = hs // 2 if hasattr(model, 't2_inv_proj') else 0
-
-        sections = []
-        offset = 0
-        sections.append(('s_out', offset, offset + hs)); offset += hs
-        if hv > 0:
-            sections.append(('v_inv', offset, offset + hv)); offset += hv
-        if ht2 > 0:
-            sections.append(('t2_inv', offset, offset + ht2)); offset += ht2
-        sections.append(('rest', offset, in_dim))
-
-        print('  Head[0] column norms by feature group:')
-        for name, lo, hi in sections:
-            cols = head_w[:, lo:hi]
-            print(f'    {name:<8} [{lo:3d}:{hi:3d}]: '
-                  f'||W||={cols.norm():.4f}  '
-                  f'per_col={cols.norm(dim=0).mean():.4f}')
-    print()
-
-
-def print_output_norm_diagnostics(model: SE3PartSegNet) -> None:
-    """Print OutputNorm weights (explains s0 decline)."""
-    print('═' * 90)
-    print('  OUTPUT NORM SCALAR WEIGHTS (s0 decline diagnostic)')
-    print('═' * 90)
-    bb = model.backbone
-    for si in range(bb.num_stages):
-        for bi, blk in enumerate(bb.encoder_stages[si].blocks):
-            sw = blk.output_norm.scalar_weight
-            print(f'  Enc{si}b{bi}: scalar_weight '
-                  f'mean={sw.mean():.4f}  '
-                  f'range=[{sw.min():.4f}, {sw.max():.4f}]')
-            if hasattr(blk.output_norm, 'type2_weight'):
-                t2w = blk.output_norm.type2_weight
-                print(f'          type2_weight  '
-                      f'mean={t2w.mean():.4f}  '
-                      f'range=[{t2w.min():.4f}, {t2w.max():.4f}]')
-    print()
+        d['v_pw'] = model.v_inv_proj.weight.norm().item()
+    return d
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -338,167 +199,188 @@ def print_output_norm_diagnostics(model: SE3PartSegNet) -> None:
 
 def main():
     p = argparse.ArgumentParser(
-        description='Trace s/v/t2 norms — verify pooling cancellation')
-    p.add_argument('--ckpt', type=str, default=None,
-                   help='Checkpoint path (shapenet_best.pt)')
-    p.add_argument('--data_root', type=str, default=None,
-                   help='ShapeNet data root (optional, uses random if absent)')
-    p.add_argument('--num_batches', type=int, default=3,
-                   help='Number of batches to average over')
-    p.add_argument('--from_scratch', action='store_true',
-                   help='Use random init (no checkpoint)')
-    p.add_argument('--device', type=str, default='cpu',
-                   help='Device (cpu for local, cuda for remote)')
+        description='Fast training trace — t2 pooling cancellation')
+    p.add_argument('--data_root', type=str, required=True,
+                   help='Path to shapenetpart_hdf5_2048')
+    p.add_argument('--epochs', type=int, default=20)
+    p.add_argument('--batches', type=int, default=5,
+                   help='Batches per epoch (0=full epoch)')
+    p.add_argument('--batch_size', type=int, default=32)
+    p.add_argument('--lr', type=float, default=1e-3)
+    p.add_argument('--workers', type=int, default=4)
+    p.add_argument('--device', type=str, default='cuda')
+    p.add_argument('--no_augment', action='store_true',
+                   help='Disable data augmentation')
     args = p.parse_args()
 
-    dev = torch.device(args.device)
+    dev = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f'Device: {dev}')
+    if dev.type == 'cuda':
+        print(f'GPU: {torch.cuda.get_device_name(0)}')
 
-    # ── Model ──
-    model_kwargs = dict(
+    # ── Data ──
+    augment = not args.no_augment
+    ds = ShapeNetPartDataset(
+        args.data_root, split='trainval', normalize=True,
+        augment=augment,
+    )
+    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                    collate_fn=collate_fn, num_workers=args.workers,
+                    pin_memory=True, drop_last=True,
+                    persistent_workers=(args.workers > 0))
+    total_batches = len(dl)
+    use_batches = total_batches if args.batches == 0 else min(
+        args.batches, total_batches)
+    print(f'Data: {len(ds)} shapes, {total_batches} batches/epoch, '
+          f'using {use_batches}')
+    print(f'Augmentation: {"ON (jitter+scale)" if augment else "OFF"}')
+
+    # ── Model (production size) ──
+    model = SE3PartSegNet(
         in_channels=1,
         hidden_scalar=96, hidden_vector=24, hidden_type2=8,
         num_stages=3, layers_per_stage=2, pool_ratio=0.25,
         head_hidden=256, use_normals=True, gate_mode='norm',
         use_self_tp=True, use_bottleneck_attn=True,
-    )
-
-    if args.ckpt and not args.from_scratch:
-        ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
-        # Use checkpoint's model_args if available
-        if 'model_args' in ckpt:
-            a = ckpt['model_args']
-            for k in ['hidden_scalar', 'hidden_vector', 'hidden_type2',
-                       'num_stages', 'layers_per_stage', 'pool_ratio',
-                       'head_hidden', 'gate_mode', 'use_self_tp',
-                       'use_bottleneck_attn']:
-                if k in a:
-                    model_kwargs[k] = a[k]
-
-    model = SE3PartSegNet(**model_kwargs).to(dev)
-
-    if args.ckpt and not args.from_scratch:
-        missing, unexpected = model.load_state_dict(
-            ckpt['model_state_dict'], strict=False)
-        if missing:
-            print(f'  Missing keys: {len(missing)}')
-        if unexpected:
-            print(f'  Unexpected keys: {len(unexpected)}')
-        epoch = ckpt.get('epoch', '?')
-        miou = ckpt.get('inst_miou', ckpt.get('miou', '?'))
-        print(f'  Loaded checkpoint: epoch={epoch}, inst_mIoU={miou}')
-
+    ).to(dev)
     print(f'Parameters: {sum(p.numel() for p in model.parameters()):,}')
 
-    # ── Install hooks ──
-    tracer = SVT2Tracer(model)
+    # ── Hooks ──
+    tracer = PoolCancelTracer(model)
     tracer.install()
-    model.eval()
 
-    # ── Data ──
-    if args.data_root:
-        from examples.shapenet_seg.dataset import (
-            ShapeNetPartDataset, collate_fn)
-        from torch.utils.data import DataLoader
-        ds = ShapeNetPartDataset(args.data_root, split='trainval',
-                                 normalize=True)
-        dl = DataLoader(ds, batch_size=16, shuffle=True,
-                        collate_fn=collate_fn, num_workers=0,
-                        drop_last=True)
-        print(f'Data: {len(ds)} shapes, using {args.num_batches} batches')
+    # ── Optimizer ──
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=1e-4)
 
+    # ── Header ──
+    est_time = use_batches * 2.5
+    print(f'\nEstimated: ~{est_time:.0f}s/epoch × {args.epochs} '
+          f'= ~{est_time * args.epochs / 60:.1f}min total')
+    print()
+    print('=' * 160)
+    # Two-line header for readability
+    h1 = (f'{"ep":>3} │ {"loss":>6} {"acc":>5} │'
+          f' {"e0b1_s":>7} {"e0b1_v":>7} {"e0b1_t2":>7} │'
+          f' {"p0_Δs%":>6} {"p0_Δv%":>6} {"p0_Δt2%":>7} │'
+          f' {"e2b1_s":>7} {"e2b1_t2":>7} │'
+          f' {"p1_Δs%":>6} {"p1_Δv%":>6} {"p1_Δt2%":>7} │'
+          f' {"t2_pw":>6} {"v_pw":>6} │ {"time":>4}')
+    print(h1)
+    print('-' * 160)
+
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+
+        # ── Eval trace (no grad) ──
+        tracer.reset()
+        model.eval()
         with torch.no_grad():
             for i, (pos, normals, labels, ptr, cat_idx) in enumerate(dl):
-                if i >= args.num_batches:
+                if i >= use_batches:
                     break
-                tracer.reset()  # reset per batch, keep last
                 pos = pos.to(dev)
                 normals = normals.to(dev)
                 ptr = ptr.to(dev)
                 cat_idx = cat_idx.to(dev)
                 _ = model(pos, ptr, cat_idx, normals)
-    else:
-        # Random input (works without data)
-        print('Using random input (no data_root specified)')
-        torch.manual_seed(42)
-        N = 512
-        pos = torch.randn(N, 3, device=dev)
-        pos = pos / pos.norm(dim=-1).max()
-        normals = torch.randn(N, 3, device=dev)
-        normals = normals / normals.norm(dim=-1, keepdim=True)
-        ptr = torch.tensor([0, N], dtype=torch.int64, device=dev)
-        cat = torch.tensor([5], dtype=torch.int64, device=dev)
+        m = tracer.means()
 
-        with torch.no_grad():
-            tracer.reset()
-            _ = model(pos, ptr, cat, normals)
+        # ── Train ──
+        model.train()
+        t_loss = 0.0; t_cor = 0; t_pts = 0; nb = 0
+        for i, (pos, normals, labels, ptr, cat_idx) in enumerate(dl):
+            if i >= use_batches:
+                break
+            pos = pos.to(dev, non_blocking=True)
+            normals = normals.to(dev, non_blocking=True)
+            labels = labels.to(dev, non_blocking=True)
+            ptr = ptr.to(dev, non_blocking=True)
+            cat_idx = cat_idx.to(dev, non_blocking=True)
 
-    # ── Report ──
-    print_trace(tracer)
-    print_weight_diagnostics(model)
-    print_output_norm_diagnostics(model)
+            logits = model(pos, ptr, cat_idx, normals)
+            loss = F.cross_entropy(logits, labels)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-    # ── Cancellation summary ──
-    print('═' * 90)
-    print('  CANCELLATION SUMMARY')
-    print('═' * 90)
-    pool_recs = [(r, tracer.records[i - 1])
-                 for i, r in enumerate(tracer.records)
-                 if 'Pool' in r['name'] and '_pre' in r['name']]
+            t_loss += loss.item(); nb += 1
+            t_cor += (logits.detach().argmax(1) == labels).sum().item()
+            t_pts += labels.shape[0]
 
-    for pre, _ in pool_recs:
-        # Find corresponding post-pool
-        pool_name = pre['name'].replace('_pre', '')
-        post = next((r for r in tracer.records if r['name'] == pool_name), None)
-        if post is None:
-            continue
+        avg_loss = t_loss / max(nb, 1)
+        avg_acc = t_cor / max(t_pts, 1)
+        dt = time.time() - t0
 
-        s_drop = (post['s_norm'] - pre['s_norm']) / max(pre['s_norm'], 1e-8) * 100
-        v_drop = (post['v_norm'] - pre['v_norm']) / max(pre['v_norm'], 1e-8) * 100
-        t2_drop = (post['t2_norm'] - pre['t2_norm']) / max(pre['t2_norm'], 1e-8) * 100
+        # ── Compute cancellation % ──
+        def drop_pct(pre_key: str, post_key: str) -> str:
+            pre = m.get(pre_key, 0)
+            post = m.get(post_key, 0)
+            if pre < 1e-6:
+                return '   N/A'
+            pct = (post - pre) / pre * 100
+            return f'{pct:+5.1f}%'
 
-        print(f'  {pool_name}:')
-        print(f'    scalar:  {pre["s_norm"]:.3f} → {post["s_norm"]:.3f}  '
-              f'({s_drop:+.1f}%)')
-        print(f'    vector:  {pre["v_norm"]:.4f} → {post["v_norm"]:.4f}  '
-              f'({v_drop:+.1f}%) '
-              f'{"← cancellation!" if v_drop < -30 else ""}')
-        print(f'    type-2:  {pre["t2_norm"]:.4f} → {post["t2_norm"]:.4f}  '
-              f'({t2_drop:+.1f}%) '
-              f'{"← SEVERE cancellation!" if t2_drop < -40 else ""}')
+        # Weight diagnostics
+        wd = get_weight_diag(model)
+
+        # ── Format row ──
+        row = (
+            f'{epoch:3d} │'
+            f' {avg_loss:6.3f} {avg_acc:5.3f} │'
+            # Stage 0 output
+            f' {m.get("e0b1_s", 0):7.3f}'
+            f' {m.get("e0b1_v", 0):7.4f}'
+            f' {m.get("e0b1_t2", 0):7.4f} │'
+            # Pool 0 drop
+            f' {drop_pct("p0_s_pre", "p0_s_post"):>6}'
+            f' {drop_pct("p0_v_pre", "p0_v_post"):>6}'
+            f' {drop_pct("p0_t2_pre", "p0_t2_post"):>7} │'
+            # Stage 2 output
+            f' {m.get("e2b1_s", 0):7.3f}'
+            f' {m.get("e2b1_t2", 0):7.4f} │'
+            # Pool 1 drop
+            f' {drop_pct("p1_s_pre", "p1_s_post"):>6}'
+            f' {drop_pct("p1_v_pre", "p1_v_post"):>6}'
+            f' {drop_pct("p1_t2_pre", "p1_t2_post"):>7} │'
+            # Projection weights
+            f' {wd.get("t2_pw", 0):6.3f}'
+            f' {wd.get("v_pw", 0):6.3f} │'
+            f' {dt:4.0f}s'
+        )
+        print(row)
+
+    # ── Summary ──
+    print('=' * 160)
+    print()
+    print('KEY:')
+    print('  e*b*_s/v/t2 = block output norms (scalar/vector/type-2)')
+    print('  p*_Δ*%      = pool cancellation (negative=norm lost)')
+    print('  t2_pw/v_pw  = t2_inv_proj / v_inv_proj weight norms')
     print()
 
-    # Theory check: scalar survives because 1D → no direction to cancel
-    s_drops = []
-    t2_drops = []
-    for pre_r, _ in pool_recs:
-        pool_name = pre_r['name'].replace('_pre', '')
-        post_r = next((r for r in tracer.records if r['name'] == pool_name), None)
-        if post_r:
-            s_drops.append(
-                (post_r['s_norm'] - pre_r['s_norm']) / max(pre_r['s_norm'], 1e-8) * 100)
-            t2_drops.append(
-                (post_r['t2_norm'] - pre_r['t2_norm']) / max(pre_r['t2_norm'], 1e-8) * 100)
+    # Final cancellation report
+    print('FINAL POOL CANCELLATION:')
+    for pi in range(2):
+        s_pre = m.get(f'p{pi}_s_pre', 0)
+        s_post = m.get(f'p{pi}_s_post', 0)
+        v_pre = m.get(f'p{pi}_v_pre', 0)
+        v_post = m.get(f'p{pi}_v_post', 0)
+        t2_pre = m.get(f'p{pi}_t2_pre', 0)
+        t2_post = m.get(f'p{pi}_t2_post', 0)
 
-    if s_drops and t2_drops:
-        avg_s = sum(s_drops) / len(s_drops)
-        avg_t2 = sum(t2_drops) / len(t2_drops)
-        print(f'  Average pooling loss:')
-        print(f'    scalar: {avg_s:+.1f}%')
-        print(f'    type-2: {avg_t2:+.1f}%')
-        if avg_t2 < -30 and avg_s > -15:
-            print()
-            print('  ╔═══════════════════════════════════════════════════════╗')
-            print('  ║ HYPOTHESIS CONFIRMED: Pooling selectively destroys   ║')
-            print('  ║ higher-order features (t2/v) via component           ║')
-            print('  ║ cancellation, while preserving scalars.              ║')
-            print('  ╚═══════════════════════════════════════════════════════╝')
-        elif abs(avg_t2) < 15:
-            print()
-            print('  Result: minimal cancellation — hypothesis NOT confirmed')
-        print()
+        def pct(a: float, b: float) -> str:
+            if b < 1e-6:
+                return 'N/A'
+            return f'{(a - b) / b * 100:+.1f}%'
 
-    print('═' * 90)
+        print(f'  Pool{pi}: s {s_pre:.3f}→{s_post:.3f} ({pct(s_post, s_pre)})  '
+              f'v {v_pre:.4f}→{v_post:.4f} ({pct(v_post, v_pre)})  '
+              f't2 {t2_pre:.4f}→{t2_post:.4f} ({pct(t2_post, t2_pre)})')
+
+    print()
+    print('=' * 160)
 
 
 if __name__ == '__main__':
