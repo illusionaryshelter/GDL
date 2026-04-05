@@ -114,7 +114,10 @@ def build_model_from_checkpoint(
         use_bottleneck_attn=a.get('use_bottleneck_attn', False),
     ).to(device)
 
-    model.load_state_dict(ckpt['model_state_dict'])
+    # strict=False: old checkpoints may have BatchNorm buffers
+    # (running_mean, running_var, num_batches_tracked) that don't exist
+    # in the new NeighborNorm. Weight/bias shapes are identical.
+    model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model.eval()
     return model
 

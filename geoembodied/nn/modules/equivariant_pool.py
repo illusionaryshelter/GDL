@@ -45,6 +45,70 @@ from typing import Optional, Tuple
 from geoembodied.functional.knn import knn
 
 
+class NeighborNorm(nn.Module):
+    """Per-seed-per-feature normalization for pool attention invariants.
+
+    For each seed point i and each invariant feature f, normalize across
+    the K neighbors:
+        x_normed[i, k, f] = (x[i, k, f] - mean_f(i)) / (std_f(i) + eps)
+    where mean_f and std_f are computed over the K dimension for seed i.
+
+    Why not BatchNorm?
+        BatchNorm normalizes each feature across ALL (seed, neighbor) pairs
+        globally, destroying intra-seed variance — exactly the signal that
+        attention needs to differentiate neighbors.
+
+    Why not per-seed joint LayerNorm (across K*F)?
+        Physical quantities like distance (≥0) and cosine similarity ([-1,1])
+        have different scales and semantics. Joint normalization mixes them,
+        suppressing features with smaller natural variance.
+
+    This module normalizes each feature INDEPENDENTLY across K neighbors,
+    maximizing each feature's discriminative power while remaining
+    semantically correct and mode-invariant (no train/eval split).
+
+    Args:
+        n_features: Number of invariant features (e.g. 7 or 8)
+        eps: Small constant for numerical stability
+
+    Input:
+        x: [N_out, K, F] — invariant features for all seed-neighbor pairs
+    Output:
+        [N_out, K, F] — per-seed-per-feature normalized, with affine transform
+    """
+
+    def __init__(self, n_features: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.n_features = n_features
+        self.eps = eps
+        # Learnable affine parameters: per-feature scale and shift.
+        # Initialized to identity (weight=1, bias=0) so the module
+        # starts as pure normalization.
+        self.weight = nn.Parameter(torch.ones(n_features))   # type: ignore[arg-type]
+        self.bias = nn.Parameter(torch.zeros(n_features))    # type: ignore[arg-type]
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Normalize invariant features per-seed, per-feature.
+
+        Args:
+            x: shape [N_out, K, F] — invariant features for pool attention.
+                Each (seed, neighbor) pair has F invariant features.
+
+        Returns:
+            Normalized tensor of same shape [N_out, K, F].
+        """
+        # x: [N_out, K, F]
+        # Compute per-seed, per-feature statistics across K neighbors
+        mean = x.mean(dim=1, keepdim=True)               # [N_out, 1, F]
+        var = x.var(dim=1, keepdim=True, unbiased=False)  # [N_out, 1, F]
+        x_normed = (x - mean) / (var + self.eps).sqrt()   # [N_out, K, F]
+        # Apply learnable affine (broadcast across N_out and K)
+        return x_normed * self.weight + self.bias
+
+    def extra_repr(self) -> str:
+        return f"n_features={self.n_features}, eps={self.eps}"
+
+
 class EquivariantPool(nn.Module):
     """FPS + attention-weighted mean pooling for equivariant features.
 
@@ -124,7 +188,7 @@ class EquivariantPool(nn.Module):
         # +1 if type-2 enabled:
         #   7. ‖t2_nbr‖_mean    — neighbor type-2 norm (SO(3)-invariant)
         n_inv_features = 7 + (1 if type2_channels > 0 else 0)
-        self.attn_feat_norm = nn.BatchNorm1d(n_inv_features)
+        self.attn_feat_norm = NeighborNorm(n_inv_features)
 
         self.geo_mlp = nn.Sequential(
             nn.Linear(n_inv_features, attn_hidden),
@@ -283,11 +347,11 @@ class EquivariantPool(nn.Module):
             attn_input = torch.stack(feat_list, dim=-1)
 
             # ── Part 2: Geometric position bias ──
-            # Per-feature BatchNorm: [N_out, K, 7] → [N_out*K, 7] → normalize → reshape
-            NK = N_out * K
-            attn_flat = attn_input.reshape(NK, -1)       # [NK, 7]
-            attn_normed = self.attn_feat_norm(attn_flat)  # [NK, 7]
-            attn_normed = attn_normed.reshape(N_out, K, -1)  # [N_out, K, 7]
+            # NeighborNorm: normalize each invariant feature INDEPENDENTLY
+            # across K neighbors within each seed. This preserves the
+            # intra-seed ranking that drives attention to discriminate
+            # neighbors, unlike BatchNorm which globally flattens variance.
+            attn_normed = self.attn_feat_norm(attn_input)  # [N_out, K, F]
 
             # geo_bias: [N_out, K]
             geo_bias = self.geo_mlp(attn_normed).squeeze(-1)  # [N_out, K]
