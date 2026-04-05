@@ -177,17 +177,21 @@ class EquivariantPool(nn.Module):
         self.attn_vec = nn.Linear(d_attn, 1, bias=False)
 
         # Geometric position bias (invariant features → scalar bias)
-        # Base 7 invariant features (l=0, l=1):
+        # Base 6 invariant features (l=0, l=1):
         #   0. dist              — Euclidean distance (≥0)
         #   1. scalar_ratio      — ‖s_nbr‖ / ‖s_seed‖ (relative, ~1.0)
         #   2. cos(v_seed, v_nbr) — cosine similarity, [-1, 1]
         #   3. cos(d̂_ij,  v_nbr) — direction-neighbor alignment, [-1, 1]
         #   4. cos(d̂_ij,  v_seed)— direction-seed alignment, [-1, 1]
-        #   5. ‖v_nbr‖          — neighbor vector magnitude
-        #   6. ‖v_seed‖         — seed vector magnitude
+        #   5. ‖v_nbr‖ - ‖v_seed‖ — relative vector magnitude diff
         # +1 if type-2 enabled:
-        #   7. ‖t2_nbr‖_mean    — neighbor type-2 norm (SO(3)-invariant)
-        n_inv_features = 7 + (1 if type2_channels > 0 else 0)
+        #   6. ‖t2_nbr‖_mean    — neighbor type-2 norm (SO(3)-invariant)
+        #
+        # NOTE: ‖v_seed‖ alone was REMOVED — it's the seed's own value,
+        # identical for all K neighbors → zero intra-seed variance → dead
+        # channel after NeighborNorm. Replaced by the relative difference
+        # ‖v_nbr‖ - ‖v_seed‖ which HAS per-neighbor variance.
+        n_inv_features = 6 + (1 if type2_channels > 0 else 0)
         self.attn_feat_norm = NeighborNorm(n_inv_features)
 
         self.geo_mlp = nn.Sequential(
@@ -197,9 +201,11 @@ class EquivariantPool(nn.Module):
         )
 
         # Learnable temperature: logits are divided by exp(log_temp).
-        # Initialized to log(1.0) = 0 (no effect). The network learns
-        # to sharpen (temp < 1) or smooth (temp > 1) attention.
-        self.log_temperature = nn.Parameter(torch.zeros(1))
+        # Initialized to -0.5 → temp ≈ 0.607 for sharper initial attention.
+        # Rationale: autopsy shows geo_bias range ≈ 2.5-3.0; dividing by
+        # 0.6 gives effective_range ≈ 4-5, closer to the ≥5.5 needed for
+        # sharp softmax over K=16. The network can still learn to adjust.
+        self.log_temperature = nn.Parameter(torch.full((1,), -0.5))
 
     def forward(
         self,
@@ -321,19 +327,24 @@ class EquivariantPool(nn.Module):
             cos_d_vi = d_vi_dot / (seed_v_norms.unsqueeze(1) + eps)  # [N_out, K, C_v]
             cos_d_vi_mean = cos_d_vi.mean(dim=-1)                  # [N_out, K]
 
-            # Feature 5 & 6: vector magnitudes
+            # Feature 5: relative vector magnitude difference
             nbr_v_norm_mean = nbr_v_norms.mean(dim=-1)             # [N_out, K]
-            seed_v_norm_mean = seed_v_norms.mean(dim=-1, keepdim=True).expand(-1, K)
+            seed_v_norm_mean = seed_v_norms.mean(dim=-1, keepdim=True)  # [N_out, 1]
+            # ‖v_nbr‖ - ‖v_seed‖: positive when neighbor has stronger
+            # vector features, negative when weaker. Unlike the removed
+            # ‖v_seed‖ (which was constant across K neighbors → dead
+            # feature in NeighborNorm), this difference HAS intra-seed
+            # variance proportional to how neighbor magnitudes differ.
+            v_norm_diff = nbr_v_norm_mean - seed_v_norm_mean        # [N_out, K]
 
-            # Stack invariant features: [N_out, K, 7 or 8]
+            # Stack invariant features: [N_out, K, 6 or 7]
             feat_list = [
                 dist,              # ≥0, physical scale
                 scalar_ratio,      # ~1.0, relative
                 cos_vi_vj_mean,    # [-1, 1], angular
                 cos_d_vj_mean,     # [-1, 1], angular
                 cos_d_vi_mean,     # [-1, 1], angular
-                nbr_v_norm_mean,   # ≥0, magnitude
-                seed_v_norm_mean,  # ≥0, magnitude
+                v_norm_diff,       # ℝ, relative magnitude
             ]
 
             # Type-2 invariant feature
