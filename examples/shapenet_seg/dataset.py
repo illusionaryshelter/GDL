@@ -362,6 +362,15 @@ class ShapeNetPartDataset(Dataset):
         num_points: Points per shape (default 2048)
         normalize: Center and scale each shape to unit sphere
         download: Auto-download TXT format if not found
+        augment: Enable data augmentation (jitter + scale + dropout).
+            Only use for training split — equivariant models do NOT
+            need SO(3) rotation augmentation (handled by architecture).
+        jitter_sigma: Gaussian noise σ for position jitter.
+            shape: [N, 3], representation: SO(3)-equivariant perturbation
+        jitter_clip: Clamp jitter to ±clip.
+        scale_low: Minimum isotropic scale factor.
+        scale_high: Maximum isotropic scale factor.
+        point_dropout_rate: Probability of dropping each point (0 = off).
     """
 
     def __init__(
@@ -371,12 +380,24 @@ class ShapeNetPartDataset(Dataset):
         num_points: int = NUM_POINTS,
         normalize: bool = True,
         download: bool = True,
+        augment: bool = False,
+        jitter_sigma: float = 0.01,
+        jitter_clip: float = 0.05,
+        scale_low: float = 0.8,
+        scale_high: float = 1.2,
+        point_dropout_rate: float = 0.0,
     ) -> None:
         super().__init__()
         self.root = root
         self.split = split
         self.num_points = num_points
         self.normalize = normalize
+        self.augment = augment
+        self.jitter_sigma = jitter_sigma
+        self.jitter_clip = jitter_clip
+        self.scale_low = scale_low
+        self.scale_high = scale_high
+        self.point_dropout_rate = point_dropout_rate
 
         # Auto-detect format
         h5_files = glob.glob(osp.join(root, '*.h5'))
@@ -427,6 +448,46 @@ class ShapeNetPartDataset(Dataset):
             normal = normal[idx_sub]
             label = label[idx_sub]
 
+        # ── Data augmentation (equivariant-safe) ──
+        # Applied BEFORE normalization so scale affects geometry.
+        # No SO(3) rotation augmentation — handled by equivariant arch.
+        if self.augment:
+            # 1. Random point dropout: remove points, then resample to
+            #    maintain fixed size. Simulates occlusion/sparse scans.
+            if self.point_dropout_rate > 0:
+                N_cur = pos.shape[0]
+                keep_mask = torch.rand(N_cur) > self.point_dropout_rate
+                n_keep = keep_mask.sum().item()
+                if n_keep < 16:  # safety: keep at least 16 points
+                    keep_mask[:16] = True
+                    n_keep = keep_mask.sum().item()
+                if n_keep < N_cur:
+                    kept_idx = keep_mask.nonzero(as_tuple=True)[0]
+                    # Resample to original size from kept points
+                    resample = kept_idx[
+                        torch.randint(0, n_keep, (N_cur,))
+                    ]
+                    pos = pos[resample]
+                    normal = normal[resample]
+                    label = label[resample]
+
+            # 2. Isotropic scale: preserves SO(3) equivariance.
+            #    Changes inter-point distances → different radius graphs
+            #    → model must generalize across scales.
+            #    scale: scalar, representation: SO(3)-invariant
+            scale = torch.empty(1).uniform_(
+                self.scale_low, self.scale_high
+            ).item()
+            pos = pos * scale
+            # Normals are direction-only, not affected by isotropic scale.
+
+            # 3. Position jitter: small Gaussian noise.
+            #    Prevents overfitting to exact point locations.
+            #    jitter: [N, 3], representation: SO(3)-covariant (isotropic)
+            jitter = torch.randn_like(pos) * self.jitter_sigma
+            jitter = jitter.clamp(-self.jitter_clip, self.jitter_clip)
+            pos = pos + jitter
+
         # ── Normalize to unit sphere ──
         if self.normalize:
             center = pos.mean(dim=0)
@@ -435,6 +496,8 @@ class ShapeNetPartDataset(Dataset):
             pos = pos / r
 
         # ── Normalize normals to unit length ──
+        # After jitter, normals remain approximately correct (jitter << scale).
+        # Re-normalize to unit length for numerical safety.
         normal = normal / normal.norm(dim=-1, keepdim=True).clamp(min=1e-6)
 
         return {

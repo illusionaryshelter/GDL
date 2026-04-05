@@ -393,6 +393,15 @@ def main() -> None:
 
     parser.add_argument('--warmup_epochs', type=int, default=0,
                         help='Linear LR warmup epochs (5 recommended)')
+    # ── Data augmentation (equivariant-safe) ──
+    parser.add_argument('--no_augment', action='store_true',
+                        help='Disable data augmentation')
+    parser.add_argument('--jitter_sigma', type=float, default=0.01,
+                        help='Gaussian jitter sigma for positions')
+    parser.add_argument('--scale_low', type=float, default=0.8,
+                        help='Min isotropic scale')
+    parser.add_argument('--scale_high', type=float, default=1.2,
+                        help='Max isotropic scale')
     args = parser.parse_args()
     if args.no_self_tp:
         args.use_self_tp = False
@@ -427,11 +436,18 @@ def main() -> None:
     print(f"Lovász weight: {args.lovasz_weight} {'(OFF)' if args.lovasz_weight == 0 else '(IoU-direct)'}")
 
     print(f"Warmup: {args.warmup_epochs} epochs {'(OFF)' if args.warmup_epochs == 0 else '(linear)'}")
+    aug_str = 'OFF' if args.no_augment else (
+        f'ON (jitter={args.jitter_sigma}, scale=[{args.scale_low},{args.scale_high}])')
+    print(f"Augmentation: {aug_str}")
     print()
 
     # ── Datasets ──
     train_dataset = ShapeNetPartDataset(
         args.data_root, split='trainval', normalize=True,
+        augment=not args.no_augment,
+        jitter_sigma=args.jitter_sigma,
+        scale_low=args.scale_low,
+        scale_high=args.scale_high,
     )
     test_dataset = ShapeNetPartDataset(
         args.data_root, split='test', normalize=True,
@@ -610,6 +626,20 @@ def main() -> None:
         if t2_inv_norm is not None:
             t2_inv_std = diag.get('t2_inv_std', 0)
             diag_log += f" | t2_inv={t2_inv_norm:.4f}±{t2_inv_std:.4f}"
+
+        # NEW: Projection weight norms + head contribution ratio
+        # These track whether weight_decay is shrinking t2/v projections
+        # and how much t2_inv actually contributes to the head input.
+        proj_parts = []
+        if hasattr(model, 't2_inv_proj'):
+            proj_parts.append(f"t2_pw={model.t2_inv_proj.weight.norm():.3f}")
+        if hasattr(model, 'v_inv_proj'):
+            proj_parts.append(f"v_pw={model.v_inv_proj.weight.norm():.3f}")
+        head_t2_r = diag.get('head_t2_ratio', None)
+        if head_t2_r is not None:
+            proj_parts.append(f"t2r={head_t2_r:.3f}")
+        if proj_parts:
+            diag_log += f" | proj:[{','.join(proj_parts)}]"
 
         # Per-pool attention diagnostics (Component 1)
         # Show per-pool temperature and uniformity to detect deep/shallow divergence

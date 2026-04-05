@@ -474,6 +474,15 @@ class SE3PartSegNet(nn.Module):
             head_parts.extend([multi_scale, one_hot])
 
             head_input = torch.cat(head_parts, dim=1)
+
+            # Head contribution ratio: how much does t2_inv contribute?
+            # ||t2_inv|| / ||head_input|| — if this collapse → 0, model ignores t2.
+            if t2_out is not None and self.hidden_type2 > 0:
+                diag['head_t2_ratio'] = (
+                    t2_inv.norm(dim=-1).mean().item()
+                    / head_input.norm(dim=-1).mean().clamp(min=1e-8).item()
+                )
+
             logits = self.head(head_input)
 
             mask = self.cat_mask[point_cat]
