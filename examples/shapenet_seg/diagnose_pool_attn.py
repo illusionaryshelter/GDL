@@ -14,7 +14,7 @@ findings from the synthetic-data local diagnosis.
 
 Key questions this script answers:
   1. Is |Q|/K_std really 4x in pool0 on real data? (data-dependent)
-  2. Is v_seed really a dead feature? (structural — should be yes)
+  2. Is v_norm_diff replacing the old v_seed dead feature working?
   3. What is the actual effective_logit_range? (data-dependent)
   4. Temperature learned value? (data-independent, just read param)
 """
@@ -220,7 +220,7 @@ def main():
         probe.remove()
     
     # ─── Print Report ───
-    feat_names = ['dist', 's_ratio', 'cos_vv', 'cos_dv_j', 'cos_dv_i', 'v_nbr', 'v_seed', 't2_nbr']
+    feat_names = ['dist', 's_ratio', 'cos_vv', 'cos_dv_j', 'cos_dv_i', 'v_norm_diff', 't2_nbr']
     
     print("\n" + "=" * 90)
     print("ATTENTION AUTOPSY — REAL ShapeNet Test Data")
