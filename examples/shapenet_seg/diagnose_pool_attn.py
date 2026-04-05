@@ -173,7 +173,26 @@ def main():
         use_self_tp=a.get('use_self_tp', False),
         use_bottleneck_attn=a.get('use_bottleneck_attn', False),
     ).to(device)
-    model.load_state_dict(ckpt['model_state_dict'], strict=False)
+    # Handle checkpoint compatibility: old checkpoints have 8 invariant
+    # features (including dead v_seed), new model has 7 (v_norm_diff).
+    # strict=False only handles missing/extra keys, NOT shape mismatches.
+    # We must manually filter out keys with incompatible shapes.
+    ckpt_sd = ckpt['model_state_dict']
+    model_sd = model.state_dict()
+    filtered_sd = {}
+    skipped = []
+    for k, v in ckpt_sd.items():
+        if k in model_sd and v.shape != model_sd[k].shape:
+            skipped.append(f"{k}: ckpt {list(v.shape)} vs model {list(model_sd[k].shape)}")
+        else:
+            filtered_sd[k] = v
+    if skipped:
+        print(f"  Skipped {len(skipped)} shape-mismatched keys (old→new invariant features):")
+        for s in skipped:
+            print(f"    {s}")
+    missing, unexpected = model.load_state_dict(filtered_sd, strict=False)
+    if missing:
+        print(f"  Missing keys (using init): {len(missing)}")
     model.eval()
     print(f"Model loaded ({sum(p.numel() for p in model.parameters()):,} params) on {device}")
     

@@ -114,10 +114,18 @@ def build_model_from_checkpoint(
         use_bottleneck_attn=a.get('use_bottleneck_attn', False),
     ).to(device)
 
-    # strict=False: old checkpoints may have BatchNorm buffers
-    # (running_mean, running_var, num_batches_tracked) that don't exist
-    # in the new NeighborNorm. Weight/bias shapes are identical.
-    model.load_state_dict(ckpt['model_state_dict'], strict=False)
+    # Handle checkpoint compatibility:
+    # - Old BN checkpoints → extra running_mean/var keys (strict=False handles)
+    # - Old 8-invariant-feature checkpoints → shape mismatch on attn_feat_norm
+    #   and geo_mlp (strict=False does NOT handle shape mismatch, must filter)
+    ckpt_sd = ckpt['model_state_dict']
+    model_sd = model.state_dict()
+    filtered_sd = {}
+    for k, v in ckpt_sd.items():
+        if k in model_sd and v.shape != model_sd[k].shape:
+            continue  # skip shape-mismatched keys (use random init)
+        filtered_sd[k] = v
+    model.load_state_dict(filtered_sd, strict=False)
     model.eval()
     return model
 
