@@ -164,17 +164,18 @@ class EquivariantPool(nn.Module):
         d_attn = max(scalar_channels // 4, 8)
         self.d_attn = d_attn
 
-        # NOTE: No 1/√d_attn scaling here. Scaling is needed for
-        # dot-product attention (Q·K) where variance grows with d_k.
-        # Our attention is ADDITIVE (GATv2: a^T · σ(Q + K)), which
-        # does not suffer from variance-grows-with-dimension.
-        # The learnable temperature provides sufficient logit control.
-
         # Q/K projections for content-aware attention
         self.q_proj = nn.Linear(scalar_channels, d_attn, bias=False)
         self.k_proj = nn.Linear(scalar_channels, d_attn, bias=False)
         # Attention vector: projects combined Q+K through nonlinearity → scalar
         self.attn_vec = nn.Linear(d_attn, 1, bias=False)
+
+        # QK-Norm: L2-normalize Q and K before adding, then scale by
+        # a learnable parameter. Without this, |Q| >> K_std (20x on
+        # real data) → SiLU(Q+K) ≈ SiLU(Q) → no neighbor discrimination.
+        # After QK-Norm: |Q_normed| = |K_normed| = qk_scale, balanced.
+        # Initialized to √d_attn (same as standard transformer convention).
+        self.qk_scale = nn.Parameter(torch.full((1,), d_attn ** 0.5))
 
         # Geometric position bias (invariant features → scalar bias)
         # Base 6 invariant features (l=0, l=1):
@@ -376,6 +377,13 @@ class EquivariantPool(nn.Module):
             # Q from seed, K from neighbor — both l=0 scalars → invariant
             Q = self.q_proj(seed_scalars)              # [N_out, d_attn]
             K_feat = self.k_proj(nbr_scalars)          # [N_out, K, d_attn]
+
+            # QK-Norm: normalize Q and K to unit vectors, then scale.
+            # Without this, |Q|/K_std ≈ 20x → SiLU(Q+K) has no K-dependent
+            # variation → content attention provides zero neighbor discrimination.
+            # After norm: both have magnitude ≈ qk_scale, balanced contribution.
+            Q = torch.nn.functional.normalize(Q, dim=-1) * self.qk_scale
+            K_feat = torch.nn.functional.normalize(K_feat, dim=-1) * self.qk_scale
 
             # GATv2: a^T * σ(Q_expand + K_feat) — dynamic because the
             # ranking of neighbors changes based on the seed's features
