@@ -439,7 +439,8 @@ class EquivariantPool(nn.Module):
                 target_v / actual_v.clamp(min=1e-8),
                 torch.ones_like(target_v),
             )
-            v_out = v_out * scale_v.unsqueeze(-1)
+            if not getattr(self, '_disable_norm_rescale', False):
+                v_out = v_out * scale_v.unsqueeze(-1)
 
             # Type-2 aggregation: [N_out, K, C_t2, 5] weighted sum → [N_out, C_t2, 5]
             t2_out = None
@@ -458,7 +459,8 @@ class EquivariantPool(nn.Module):
                     target_t2 / actual_t2.clamp(min=1e-8),
                     torch.ones_like(target_t2),
                 )
-                t2_out = t2_out * scale_t2.unsqueeze(-1)
+                if not getattr(self, '_disable_norm_rescale', False):
+                    t2_out = t2_out * scale_t2.unsqueeze(-1)
 
             # Zero out features from invalid neighbors
             all_invalid = ~valid_mask.any(dim=1)  # [N_out]
