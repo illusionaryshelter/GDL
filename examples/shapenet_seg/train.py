@@ -402,6 +402,8 @@ def main() -> None:
                         help='Min isotropic scale')
     parser.add_argument('--scale_high', type=float, default=1.2,
                         help='Max isotropic scale')
+    parser.add_argument('--disable_norm_rescale', action='store_true',
+                        help='Disable norm-preserving rescaling in pool (ablation)')
     args = parser.parse_args()
     if args.no_self_tp:
         args.use_self_tp = False
@@ -493,6 +495,14 @@ def main() -> None:
         use_bottleneck_attn=args.use_bottleneck_attn,
 
     ).to(device)
+
+    # ── Ablation: disable norm-preserving rescaling if requested ──
+    if args.disable_norm_rescale:
+        from geoembodied.nn.modules.equivariant_pool import EquivariantPool
+        for m in model.modules():
+            if isinstance(m, EquivariantPool):
+                m._disable_norm_rescale = True
+        print('  ⚠ Norm-preserving rescaling DISABLED (ablation mode)')
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
