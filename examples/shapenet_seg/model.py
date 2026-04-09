@@ -58,6 +58,7 @@ class SE3PartSegNet(_SE3PartSegNet):
         gate_mode: str = 'scalar',
         use_self_tp: bool = False,
         use_bottleneck_attn: bool = False,
+        use_tp_fusion: bool = True,
     ) -> None:
         super().__init__(
             num_categories=NUM_CATEGORIES,
@@ -75,5 +76,6 @@ class SE3PartSegNet(_SE3PartSegNet):
             gate_mode=gate_mode,
             use_self_tp=use_self_tp,
             use_bottleneck_attn=use_bottleneck_attn,
+            use_tp_fusion=use_tp_fusion,
         )
 
