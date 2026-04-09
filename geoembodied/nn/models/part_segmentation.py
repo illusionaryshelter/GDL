@@ -113,6 +113,7 @@ class SE3PartSegNet(nn.Module):
         gate_mode: str = 'scalar',
         use_self_tp: bool = False,
         use_bottleneck_attn: bool = False,
+        use_tp_fusion: bool = True,
     ) -> None:
         super().__init__()
         self.num_categories = num_categories
@@ -122,6 +123,7 @@ class SE3PartSegNet(nn.Module):
         self.hidden_vector = hidden_vector
         self.hidden_type2 = hidden_type2
         self.num_stages = num_stages
+        self.use_tp_fusion = use_tp_fusion
 
         # U-Net backbone
         self.backbone = MultiScaleSE3Net(
@@ -135,6 +137,7 @@ class SE3PartSegNet(nn.Module):
             gate_mode=gate_mode,
             use_self_tp=use_self_tp,
             use_bottleneck_attn=use_bottleneck_attn,
+            use_tp_fusion=use_tp_fusion,
         )
 
         # Normal vector embedding: project 3D normals → C_v vector channels
@@ -177,31 +180,48 @@ class SE3PartSegNet(nn.Module):
             self.t2_inv_norm = nn.LayerNorm(t2_inv_out)
 
         # ── Classification Head ──
+        # With TP fusion: decoder handles multi-scale fusion, so head only
+        # needs local features + category. Without: also add multi-scale globals.
+        #
         # Input: local scalar [N, C_s]
         #        + vector invariant [N, C_s // 2] (projected ||v_c||)
         #        + type-2 invariant [N, C_s // 2] (projected ||t2_c||)
-        #        + multi-scale globals [N, num_stages * C_s]
+        #        + (legacy only) multi-scale globals [N, num_stages * C_s]
         #        + category one-hot [N, num_categories]
         # Output: logits [N, num_parts]
         head_in = (
             hidden_scalar           # s_out
             + hidden_scalar // 2    # v_inv (projected vector norms)
             + t2_inv_out            # t2_inv (projected type-2 norms)
-            + hidden_scalar * num_stages  # multi-scale globals
             + num_categories        # category one-hot
         )
+        if not use_tp_fusion:
+            head_in += hidden_scalar * num_stages  # multi-scale globals
+
         self._head_in_dim = head_in  # for diagnostics
-        self.head = nn.Sequential(
-            nn.Linear(head_in, head_hidden),
-            nn.LayerNorm(head_hidden),
-            nn.SiLU(),
-            nn.Dropout(0.15),
-            nn.Linear(head_hidden, head_hidden),
-            nn.LayerNorm(head_hidden),
-            nn.SiLU(),
-            nn.Dropout(0.1),
-            nn.Linear(head_hidden, num_parts),
-        )
+
+        if use_tp_fusion:
+            # Route B: slim 1-layer head (decoder does the heavy lifting)
+            self.head = nn.Sequential(
+                nn.Linear(head_in, head_hidden),
+                nn.LayerNorm(head_hidden),
+                nn.SiLU(),
+                nn.Dropout(0.15),
+                nn.Linear(head_hidden, num_parts),
+            )
+        else:
+            # Legacy: 2-layer head (compensates for weak decoder fusion)
+            self.head = nn.Sequential(
+                nn.Linear(head_in, head_hidden),
+                nn.LayerNorm(head_hidden),
+                nn.SiLU(),
+                nn.Dropout(0.15),
+                nn.Linear(head_hidden, head_hidden),
+                nn.LayerNorm(head_hidden),
+                nn.SiLU(),
+                nn.Dropout(0.1),
+                nn.Linear(head_hidden, num_parts),
+            )
 
         # Register category mask as buffer (moves with model to device)
         if category_part_mask is not None:
@@ -298,29 +318,32 @@ class SE3PartSegNet(nn.Module):
             if self.use_normals and normals is not None:
                 v_init = self.inject_normals(normals)  # [N, C_v, 3]
 
-            # ── 2. Run U-Net backbone (with encoder features for multi-scale head) ──
-            backbone_out = self.backbone(
-                pos, ptr, features=features, v_init=v_init,
-                return_encoder_features=True,
-            )
-            if self.hidden_type2 > 0:
-                s_out, v_out, t2_out, _, enc_s_list, enc_ptr_list = backbone_out
+            # ── 2. Run U-Net backbone ──
+            if self.use_tp_fusion:
+                # Route B: decoder does cross-scale fusion, no need for
+                # encoder features at the model level
+                backbone_out = self.backbone(
+                    pos, ptr, features=features, v_init=v_init,
+                    return_encoder_features=False,
+                )
+                if self.hidden_type2 > 0:
+                    s_out, v_out, t2_out, _ = backbone_out
+                else:
+                    s_out, v_out, _ = backbone_out
+                    t2_out = None
             else:
-                s_out, v_out, _, enc_s_list, enc_ptr_list = backbone_out
-                t2_out = None
+                # Legacy: need encoder features for multi-scale globals
+                backbone_out = self.backbone(
+                    pos, ptr, features=features, v_init=v_init,
+                    return_encoder_features=True,
+                )
+                if self.hidden_type2 > 0:
+                    s_out, v_out, t2_out, _, enc_s_list, enc_ptr_list = backbone_out
+                else:
+                    s_out, v_out, _, enc_s_list, enc_ptr_list = backbone_out
+                    t2_out = None
 
-            # ── 3. Build multi-scale global features ──
-            global_feats = []
-            for enc_s, enc_ptr in zip(enc_s_list, enc_ptr_list):
-                B_enc = enc_ptr.shape[0] - 1
-                enc_counts = enc_ptr[1:] - enc_ptr[:-1]
-                enc_batch = torch.arange(B_enc, device=device).repeat_interleave(enc_counts)
-                shape_sum = torch.zeros(B_enc, self.hidden_scalar, device=device, dtype=enc_s.dtype)
-                shape_sum.scatter_add_(0, enc_batch.unsqueeze(1).expand_as(enc_s), enc_s)
-                shape_mean = shape_sum / enc_counts.unsqueeze(1).clamp(min=1).to(enc_s.dtype)
-                global_feats.append(shape_mean)
-
-            # ── 4. Build per-point category one-hot ──
+            # ── 3. Build per-point category one-hot ──
             sizes = ptr[1:] - ptr[:-1]
             point_cat_batch = torch.arange(B, device=device).repeat_interleave(sizes)
             point_cat = cat_indices[point_cat_batch]
@@ -328,11 +351,21 @@ class SE3PartSegNet(nn.Module):
             one_hot = torch.zeros(N, self.num_categories, device=device, dtype=s_out.dtype)
             one_hot.scatter_(1, point_cat.unsqueeze(1), 1.0)
 
-            # ── 5. Multi-scale global → per-point broadcast ──
-            point_globals = [g[point_cat_batch] for g in global_feats]
-            multi_scale = torch.cat(point_globals, dim=-1)
+            # ── 4. Multi-scale global → per-point broadcast (legacy only) ──
+            if not self.use_tp_fusion:
+                global_feats = []
+                for enc_s, enc_ptr in zip(enc_s_list, enc_ptr_list):
+                    B_enc = enc_ptr.shape[0] - 1
+                    enc_counts = enc_ptr[1:] - enc_ptr[:-1]
+                    enc_batch = torch.arange(B_enc, device=device).repeat_interleave(enc_counts)
+                    shape_sum = torch.zeros(B_enc, self.hidden_scalar, device=device, dtype=enc_s.dtype)
+                    shape_sum.scatter_add_(0, enc_batch.unsqueeze(1).expand_as(enc_s), enc_s)
+                    shape_mean = shape_sum / enc_counts.unsqueeze(1).clamp(min=1).to(enc_s.dtype)
+                    global_feats.append(shape_mean)
+                point_globals = [g[point_cat_batch] for g in global_feats]
+                multi_scale = torch.cat(point_globals, dim=-1)
 
-            # ── 6. Invariant feature extraction ──
+            # ── 5. Invariant feature extraction ──
             # All features entering the head MUST be SO(3)-invariant.
             head_parts = [s_out]
 
@@ -348,13 +381,16 @@ class SE3PartSegNet(nn.Module):
                 t2_norms = t2_out.norm(dim=-1)  # [N, C_t2]
                 t2_inv = self.t2_inv_norm(self.t2_inv_proj(t2_norms))  # [N, C_s // 2]
                 head_parts.append(t2_inv)
-            head_parts.extend([multi_scale, one_hot])
 
-            # ── 7. Classification head ──
+            if not self.use_tp_fusion:
+                head_parts.append(multi_scale)
+            head_parts.append(one_hot)
+
+            # ── 6. Classification head ──
             head_input = torch.cat(head_parts, dim=1)
             logits = self.head(head_input)
 
-            # ── 8. Category masking ──
+            # ── 7. Category masking ──
             mask = self.cat_mask[point_cat]
             logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
 

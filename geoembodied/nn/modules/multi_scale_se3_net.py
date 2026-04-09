@@ -43,6 +43,7 @@ from geoembodied.nn.modules.se3_block import SE3NetBlock
 from geoembodied.nn.modules.spatial_graph import SpatialGraph
 from geoembodied.nn.modules.equivariant_pool import EquivariantPool
 from geoembodied.nn.modules.equivariant_interp import EquivariantInterpolate
+from geoembodied.nn.modules.equivariant_skip_fusion import EquivariantSkipFusion
 from geoembodied.nn.modules.equivariant_norm import EquivariantLayerNorm
 from geoembodied.nn.modules.geometric_self_attention import InvariantSelfAttention
 from geoembodied.functional.knn import knn_self
@@ -306,11 +307,13 @@ class MultiScaleSE3Net(nn.Module):
         pool_ratio: float = 0.25,
         pool_k: int = 16,
         interp_k: int = 3,
+        fusion_k: int = 6,
         radius_multiplier: float = 4.0,
         gate_mode: str = 'scalar',
         use_self_tp: bool = False,
         use_bottleneck_attn: bool = False,
         attn_num_heads: int = 4,
+        use_tp_fusion: bool = True,
     ) -> None:
         super().__init__()
         self.in_channels = in_channels
@@ -351,37 +354,56 @@ class MultiScaleSE3Net(nn.Module):
 
         # ── Decoder ──
         self.decoder_stages = nn.ModuleList()
-        self.interp_layers = nn.ModuleList()
-        self.skip_proj_s = nn.ModuleList()
-        self.skip_proj_v = nn.ModuleList()
-        self.skip_proj_t2 = nn.ModuleList()
-        self.skip_norms = nn.ModuleList()
+        self.use_tp_fusion = use_tp_fusion
 
-        for i in range(num_stages - 1):
-            self.interp_layers.append(EquivariantInterpolate(k_neighbors=interp_k))
+        if use_tp_fusion:
+            # Cross-scale TP fusion (Route B: direction-aware)
+            self.fusion_layers = nn.ModuleList()
+            for i in range(num_stages - 1):
+                self.fusion_layers.append(EquivariantSkipFusion(
+                    scalar_channels=C_s,
+                    vector_channels=C_v,
+                    type2_channels=C_t2,
+                    k_neighbors=fusion_k,
+                    gate_mode=gate_mode,
+                ))
+                self.decoder_stages.append(_EncoderStage(
+                    channels_scalar=C_s,
+                    channels_vector=C_v,
+                    channels_type2=C_t2,
+                    num_layers=layers_per_stage,
+                    radius_multiplier=radius_multiplier,
+                    gate_mode=gate_mode,
+                    use_self_tp=use_self_tp,
+                ))
+        else:
+            # Legacy: concat+Linear skip connections (for backwards compat)
+            self.interp_layers = nn.ModuleList()
+            self.skip_proj_s = nn.ModuleList()
+            self.skip_proj_v = nn.ModuleList()
+            self.skip_proj_t2 = nn.ModuleList()
+            self.skip_norms = nn.ModuleList()
 
-            self.skip_proj_s.append(nn.Linear(C_s * 2, C_s))
-            self.skip_proj_v.append(nn.Linear(C_v * 2, C_v, bias=False))
-
-            # Type-2 skip projection
-            if C_t2 > 0:
-                self.skip_proj_t2.append(nn.Linear(C_t2 * 2, C_t2, bias=False))
-            else:
-                self.skip_proj_t2.append(None)
-
-            self.skip_norms.append(EquivariantLayerNorm(
-                num_scalars=C_s, num_vectors=C_v, num_type2=C_t2,
-            ))
-
-            self.decoder_stages.append(_EncoderStage(
-                channels_scalar=C_s,
-                channels_vector=C_v,
-                channels_type2=C_t2,
-                num_layers=layers_per_stage,
-                radius_multiplier=radius_multiplier,
-                gate_mode=gate_mode,
-                use_self_tp=use_self_tp,
-            ))
+            for i in range(num_stages - 1):
+                self.interp_layers.append(EquivariantInterpolate(k_neighbors=interp_k))
+                self.skip_proj_s.append(nn.Linear(C_s * 2, C_s))
+                self.skip_proj_v.append(nn.Linear(C_v * 2, C_v, bias=False))
+                if C_t2 > 0:
+                    self.skip_proj_t2.append(nn.Linear(C_t2 * 2, C_t2, bias=False))
+                else:
+                    self.skip_proj_t2.append(None)
+                self.skip_norms.append(EquivariantLayerNorm(
+                    num_scalars=C_s, num_vectors=C_v, num_type2=C_t2,
+                ))
+                self.decoder_stages.append(_EncoderStage(
+                    channels_scalar=C_s,
+                    channels_vector=C_v,
+                    channels_type2=C_t2,
+                    num_layers=layers_per_stage,
+                    radius_multiplier=radius_multiplier,
+                    gate_mode=gate_mode,
+                    use_self_tp=use_self_tp,
+                ))
 
         # ── Final Norm ──
         self.final_norm = EquivariantLayerNorm(
@@ -522,39 +544,52 @@ class MultiScaleSE3Net(nn.Module):
 
         # ── Decoder ──
         for i in range(self.num_stages - 2, -1, -1):
-            if has_t2:
-                s_interp, v_interp, t2_interp = self.interp_layers[i](
-                    enc_pos_list[i], cur_pos, s, v,
-                    enc_ptr_list[i], cur_ptr,
-                    s_skip=enc_s_list[i], v_skip=enc_v_list[i],
-                    t2_coarse=t2, t2_skip=enc_t2_list[i],
-                )
+            if self.use_tp_fusion:
+                # Cross-scale TP fusion (Route B)
+                if has_t2:
+                    s, v, t2 = self.fusion_layers[i](
+                        enc_pos_list[i], cur_pos,
+                        s, v, enc_ptr_list[i], cur_ptr,
+                        s_skip=enc_s_list[i], v_skip=enc_v_list[i],
+                        t2_coarse=t2, t2_skip=enc_t2_list[i],
+                    )
+                else:
+                    s, v = self.fusion_layers[i](
+                        enc_pos_list[i], cur_pos,
+                        s, v, enc_ptr_list[i], cur_ptr,
+                        s_skip=enc_s_list[i], v_skip=enc_v_list[i],
+                    )
             else:
-                s_interp, v_interp = self.interp_layers[i](
-                    enc_pos_list[i], cur_pos, s, v,
-                    enc_ptr_list[i], cur_ptr,
-                    s_skip=enc_s_list[i], v_skip=enc_v_list[i],
-                )
+                # Legacy: EquivariantInterpolate + skip proj + skip norm
+                if has_t2:
+                    s_interp, v_interp, t2_interp = self.interp_layers[i](
+                        enc_pos_list[i], cur_pos, s, v,
+                        enc_ptr_list[i], cur_ptr,
+                        s_skip=enc_s_list[i], v_skip=enc_v_list[i],
+                        t2_coarse=t2, t2_skip=enc_t2_list[i],
+                    )
+                else:
+                    s_interp, v_interp = self.interp_layers[i](
+                        enc_pos_list[i], cur_pos, s, v,
+                        enc_ptr_list[i], cur_ptr,
+                        s_skip=enc_s_list[i], v_skip=enc_v_list[i],
+                    )
 
-            # Project back
-            s = self.skip_proj_s[i](s_interp)
+                s = self.skip_proj_s[i](s_interp)
+                N_i = v_interp.shape[0]
+                v_flat = v_interp.transpose(1, 2).reshape(N_i * 3, C_v * 2)
+                v_proj = self.skip_proj_v[i](v_flat)
+                v = v_proj.reshape(N_i, 3, C_v).transpose(1, 2)
 
-            N_i = v_interp.shape[0]
-            v_flat = v_interp.transpose(1, 2).reshape(N_i * 3, C_v * 2)
-            v_proj = self.skip_proj_v[i](v_flat)
-            v = v_proj.reshape(N_i, 3, C_v).transpose(1, 2)
+                if has_t2:
+                    t2_flat = t2_interp.transpose(1, 2).reshape(N_i * 5, C_t2 * 2)
+                    t2_proj = self.skip_proj_t2[i](t2_flat)
+                    t2 = t2_proj.reshape(N_i, 5, C_t2).transpose(1, 2)
 
-            if has_t2:
-                # t2_interp: [N_i, C_t2*2, 5] → project → [N_i, C_t2, 5]
-                t2_flat = t2_interp.transpose(1, 2).reshape(N_i * 5, C_t2 * 2)
-                t2_proj = self.skip_proj_t2[i](t2_flat)
-                t2 = t2_proj.reshape(N_i, 5, C_t2).transpose(1, 2)
-
-            # Skip norm
-            if has_t2:
-                s, v, t2 = self.skip_norms[i](s, v, t2)
-            else:
-                s, v = self.skip_norms[i](s, v)
+                if has_t2:
+                    s, v, t2 = self.skip_norms[i](s, v, t2)
+                else:
+                    s, v = self.skip_norms[i](s, v)
 
             cur_pos = enc_pos_list[i]
             cur_ptr = enc_ptr_list[i]

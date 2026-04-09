@@ -24,6 +24,7 @@ from geoembodied.nn.modules.se3_net import SE3Net, global_mean_pool
 from geoembodied.nn.modules.spatial_graph import SpatialGraph
 from geoembodied.nn.modules.equivariant_pool import EquivariantPool
 from geoembodied.nn.modules.equivariant_interp import EquivariantInterpolate
+from geoembodied.nn.modules.equivariant_skip_fusion import EquivariantSkipFusion
 from geoembodied.nn.modules.multi_scale_se3_net import MultiScaleSE3Net
 
 __all__ = [
@@ -41,5 +42,6 @@ __all__ = [
     "SpatialGraph",
     "EquivariantPool",
     "EquivariantInterpolate",
+    "EquivariantSkipFusion",
     "MultiScaleSE3Net",
 ]
