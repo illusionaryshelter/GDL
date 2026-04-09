@@ -113,30 +113,42 @@ def test_t2_norm_sq_invariance():
 
 
 def test_head_input_dimension():
-    """Test that the head input dimension calculation matches expected."""
+    """Test that the head input dimension calculation matches expected.
+
+    Route A: s_out + v_inv + t2_inv + multi_scale_globals + one_hot
+    Route B: s_out + v_inv + t2_inv + one_hot  (no multi-scale globals)
+    """
     from geoembodied.nn.models.part_segmentation import SE3PartSegNet
 
     C_s, C_v, C_t2 = 48, 12, 4
     num_stages, num_cats = 2, 16
 
-    model = SE3PartSegNet(
-        num_categories=num_cats,
-        num_parts=50,
-        hidden_scalar=C_s,
-        hidden_vector=C_v,
-        hidden_type2=C_t2,
-        num_stages=num_stages,
-        head_hidden=128,
-    )
-
-    # t2_inv is projected: Linear(C_t2, C_s//2) + LayerNorm → output dim = C_s//2
     t2_inv_out = C_s // 2 if C_t2 > 0 else 0
-    expected = C_s + C_s // 2 + t2_inv_out + C_s * num_stages + num_cats
-    assert model._head_in_dim == expected, (
-        f"Head dim mismatch: expected {expected}, got {model._head_in_dim}"
+
+    # Route B (use_tp_fusion=True, default)
+    model_b = SE3PartSegNet(
+        num_categories=num_cats, num_parts=50,
+        hidden_scalar=C_s, hidden_vector=C_v, hidden_type2=C_t2,
+        num_stages=num_stages, head_hidden=128, use_tp_fusion=True,
     )
-    print(f"  [PASS] head_in_dim = {expected} (C_s={C_s} + v_inv={C_s // 2} + "
-          f"t2_inv={t2_inv_out} + stages*C_s={num_stages * C_s} + cats={num_cats})")
+    expected_b = C_s + C_s // 2 + t2_inv_out + num_cats
+    assert model_b._head_in_dim == expected_b, (
+        f"Route B head dim mismatch: expected {expected_b}, got {model_b._head_in_dim}"
+    )
+    print(f"  [PASS] Route B head_in_dim = {expected_b} (C_s={C_s} + v_inv={C_s // 2} + "
+          f"t2_inv={t2_inv_out} + cats={num_cats})")
+
+    # Route A (use_tp_fusion=False)
+    model_a = SE3PartSegNet(
+        num_categories=num_cats, num_parts=50,
+        hidden_scalar=C_s, hidden_vector=C_v, hidden_type2=C_t2,
+        num_stages=num_stages, head_hidden=128, use_tp_fusion=False,
+    )
+    expected_a = C_s + C_s // 2 + t2_inv_out + C_s * num_stages + num_cats
+    assert model_a._head_in_dim == expected_a, (
+        f"Route A head dim mismatch: expected {expected_a}, got {model_a._head_in_dim}"
+    )
+    print(f"  [PASS] Route A head_in_dim = {expected_a} (+ stages*C_s={num_stages * C_s})")
 
 
 def test_gradient_flow_through_v_inv():
