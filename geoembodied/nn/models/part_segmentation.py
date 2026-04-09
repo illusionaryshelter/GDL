@@ -433,14 +433,15 @@ class SE3PartSegNet(nn.Module):
                 v_init = self.inject_normals(normals)
 
             if self.use_tp_fusion:
+                # For diagnostics, also request encoder features
                 backbone_out = self.backbone(
                     pos, ptr, features=features, v_init=v_init,
-                    return_encoder_features=False,
+                    return_encoder_features=True,
                 )
                 if self.hidden_type2 > 0:
-                    s_out, v_out, t2_out, _ = backbone_out
+                    s_out, v_out, t2_out, _, enc_s_list, enc_ptr_list = backbone_out
                 else:
-                    s_out, v_out, _ = backbone_out
+                    s_out, v_out, _, enc_s_list, enc_ptr_list = backbone_out
                     t2_out = None
             else:
                 backbone_out = self.backbone(
@@ -462,9 +463,9 @@ class SE3PartSegNet(nn.Module):
             diag['v_norm_mean'] = v_per_point.mean().item()
             diag['v_norm_std'] = v_per_point.std().item()
 
-            if not self.use_tp_fusion:
-                for i, enc_s in enumerate(enc_s_list):
-                    diag[f'enc{i}_s_norm'] = enc_s.norm(dim=-1).mean().item()
+            # Encoder per-stage scalar norms (both Route A and B)
+            for i, enc_s in enumerate(enc_s_list):
+                diag[f'enc{i}_s_norm'] = enc_s.norm(dim=-1).mean().item()
 
             # Decoder output scalar norm (post-final_norm)
             diag['s_out_norm'] = s_out.norm(dim=-1).mean().item()
@@ -476,6 +477,29 @@ class SE3PartSegNet(nn.Module):
                 diag['t2_norm_std'] = t2_norms.std().item()
 
             diag.update(self.get_pool_attn_stats())
+
+            # ── Fusion layer diagnostics (Route B only) ──
+            if self.use_tp_fusion and hasattr(self.backbone, 'fusion_layers'):
+                from geoembodied.nn.modules.equivariant_skip_fusion import EquivariantSkipFusion
+                for idx, fl in enumerate(self.backbone.fusion_layers):
+                    if not isinstance(fl, EquivariantSkipFusion):
+                        continue
+                    prefix = f'fus{idx}'
+                    if hasattr(fl, '_last_gate_s_mean'):
+                        diag[f'{prefix}_gate_s'] = fl._last_gate_s_mean
+                    if hasattr(fl, '_last_gate_v_mean'):
+                        diag[f'{prefix}_gate_v'] = fl._last_gate_v_mean
+                    if hasattr(fl, '_last_gate_t2_mean'):
+                        diag[f'{prefix}_gate_t2'] = fl._last_gate_t2_mean
+                    if hasattr(fl, '_last_tp_s_norm'):
+                        diag[f'{prefix}_tp_s'] = fl._last_tp_s_norm
+                    if hasattr(fl, '_last_tp_t2_norm'):
+                        diag[f'{prefix}_tp_t2'] = fl._last_tp_t2_norm
+                    if hasattr(fl, '_last_degenerate_count'):
+                        total = getattr(fl, '_last_total_edges', 1)
+                        diag[f'{prefix}_degen'] = (
+                            fl._last_degenerate_count / max(total, 1)
+                        )
 
             # ── Build head input (same as forward) ──
             sizes = ptr[1:] - ptr[:-1]

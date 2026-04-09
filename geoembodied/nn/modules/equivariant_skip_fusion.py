@@ -453,10 +453,19 @@ class EquivariantSkipFusion(nn.Module):
             g_s = self.skip_gate_s(gate_input)  # [N_fine, C_s]
             s_out = g_s * s_skip_f + (1.0 - g_s) * s_tp
 
+            # ── Training diagnostics (cached for monitoring) ──
+            # These are read by forward_with_diagnostics in SE3PartSegNet.
+            self._last_gate_s_mean = g_s.mean().item()  # type: ignore[assignment]
+            self._last_tp_s_norm = s_tp.norm(dim=-1).mean().item()  # type: ignore[assignment]
+            self._last_skip_s_norm = s_skip_f.norm(dim=-1).mean().item()  # type: ignore[assignment]
+            self._last_degenerate_count = degenerate_mask.sum().item()  # type: ignore[assignment]
+            self._last_total_edges = valid_mask.sum().item()  # type: ignore[assignment]
+
             # Vector fusion: gate from scalars (equivariant)
             if self.skip_gate_v is not None:
                 g_v = self.skip_gate_v(gate_input)  # [N_fine, C_v]
                 v_out = g_v.unsqueeze(-1) * v_skip_f + (1.0 - g_v).unsqueeze(-1) * v_tp
+                self._last_gate_v_mean = g_v.mean().item()  # type: ignore[assignment]
             else:
                 v_out = v_tp
 
@@ -465,6 +474,8 @@ class EquivariantSkipFusion(nn.Module):
                 t2_skip_f = t2_skip.to(compute_dtype) if t2_skip is not None else torch.zeros_like(t2_tp)
                 g_t2 = self.skip_gate_t2(gate_input)  # [N_fine, C_t2]
                 t2_out = g_t2.unsqueeze(-1) * t2_skip_f + (1.0 - g_t2).unsqueeze(-1) * t2_tp
+                self._last_gate_t2_mean = g_t2.mean().item()  # type: ignore[assignment]
+                self._last_tp_t2_norm = t2_tp.norm(dim=-1).mean().item()  # type: ignore[assignment]
             else:
                 t2_out = t2_tp
 

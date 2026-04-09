@@ -378,8 +378,9 @@ def main() -> None:
                         help='Enable bottleneck geometric attention')
     parser.add_argument('--no_bottleneck_attn', action='store_true',
                         help='Disable bottleneck geometric attention')
-    parser.add_argument('--hidden_type2', type=int, default=0,
-                        help='Type-2 (l=2) channels. 0=disabled, 4=recommended')
+    parser.add_argument('--hidden_type2', type=int, default=8,
+                        help='Type-2 (l=2) channels. 0=disabled, 8=recommended '
+                             '(rank-saturated, +19%% params). 4=min viable, 16=max')
     parser.add_argument('--head_hidden', type=int, default=128,
                         help='Classification head hidden dim')
     parser.add_argument('--compile', action='store_true',
@@ -690,6 +691,29 @@ def main() -> None:
                     )
         if skip_parts:
             diag_log += '\n  ├─ skip: ' + ' '.join(skip_parts)
+
+        # ── Fusion layer diagnostics (Route B only) ──
+        if args.use_tp_fusion:
+            fus_parts = []
+            for i in range(args.num_stages - 1):
+                gs = diag.get(f'fus{i}_gate_s', None)
+                gv = diag.get(f'fus{i}_gate_v', None)
+                gt2 = diag.get(f'fus{i}_gate_t2', None)
+                tp_s = diag.get(f'fus{i}_tp_s', None)
+                degen = diag.get(f'fus{i}_degen', None)
+                if gs is not None:
+                    parts = [f'gs={gs:.3f}']
+                    if gv is not None:
+                        parts.append(f'gv={gv:.3f}')
+                    if gt2 is not None:
+                        parts.append(f'gt2={gt2:.3f}')
+                    if tp_s is not None:
+                        parts.append(f'tp_s={tp_s:.3f}')
+                    if degen is not None:
+                        parts.append(f'deg={degen:.2%}')
+                    fus_parts.append(f'f{i}[{",".join(parts)}]')
+            if fus_parts:
+                diag_log += '\n  ├─ fusion: ' + ' '.join(fus_parts)
 
         if scaler_scale > 0:
             diag_log += f" | amp_scale={scaler_scale:.0f}"
