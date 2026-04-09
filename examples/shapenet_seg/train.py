@@ -404,11 +404,17 @@ def main() -> None:
                         help='Max isotropic scale')
     parser.add_argument('--disable_norm_rescale', action='store_true',
                         help='Disable norm-preserving rescaling in pool (ablation)')
+    parser.add_argument('--use_tp_fusion', action='store_true', default=True,
+                        help='Use cross-scale TP decoder fusion (Route B)')
+    parser.add_argument('--no_tp_fusion', action='store_true',
+                        help='Disable TP fusion, use legacy concat+Linear skip (Route A)')
     args = parser.parse_args()
     if args.no_self_tp:
         args.use_self_tp = False
     if args.no_bottleneck_attn:
         args.use_bottleneck_attn = False
+    if args.no_tp_fusion:
+        args.use_tp_fusion = False
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = not args.no_amp and device.type == 'cuda'
@@ -441,6 +447,8 @@ def main() -> None:
     aug_str = 'OFF' if args.no_augment else (
         f'ON (jitter={args.jitter_sigma}, scale=[{args.scale_low},{args.scale_high}])')
     print(f"Augmentation: {aug_str}")
+    fusion_str = 'Route B (cross-scale TP)' if args.use_tp_fusion else 'Legacy (concat+Linear)'
+    print(f"Decoder fusion: {fusion_str}")
     print()
 
     # ── Datasets ──
@@ -493,7 +501,7 @@ def main() -> None:
         gate_mode=args.gate_mode,
         use_self_tp=args.use_self_tp,
         use_bottleneck_attn=args.use_bottleneck_attn,
-
+        use_tp_fusion=args.use_tp_fusion,
     ).to(device)
 
     # ── Ablation: disable norm-preserving rescaling if requested ──

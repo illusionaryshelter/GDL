@@ -432,15 +432,26 @@ class SE3PartSegNet(nn.Module):
             if self.use_normals and normals is not None:
                 v_init = self.inject_normals(normals)
 
-            backbone_out = self.backbone(
-                pos, ptr, features=features, v_init=v_init,
-                return_encoder_features=True,
-            )
-            if self.hidden_type2 > 0:
-                s_out, v_out, t2_out, _, enc_s_list, enc_ptr_list = backbone_out
+            if self.use_tp_fusion:
+                backbone_out = self.backbone(
+                    pos, ptr, features=features, v_init=v_init,
+                    return_encoder_features=False,
+                )
+                if self.hidden_type2 > 0:
+                    s_out, v_out, t2_out, _ = backbone_out
+                else:
+                    s_out, v_out, _ = backbone_out
+                    t2_out = None
             else:
-                s_out, v_out, _, enc_s_list, enc_ptr_list = backbone_out
-                t2_out = None
+                backbone_out = self.backbone(
+                    pos, ptr, features=features, v_init=v_init,
+                    return_encoder_features=True,
+                )
+                if self.hidden_type2 > 0:
+                    s_out, v_out, t2_out, _, enc_s_list, enc_ptr_list = backbone_out
+                else:
+                    s_out, v_out, _, enc_s_list, enc_ptr_list = backbone_out
+                    t2_out = None
 
             # ── Diagnostics ──
             diag: dict = {}
@@ -451,8 +462,9 @@ class SE3PartSegNet(nn.Module):
             diag['v_norm_mean'] = v_per_point.mean().item()
             diag['v_norm_std'] = v_per_point.std().item()
 
-            for i, enc_s in enumerate(enc_s_list):
-                diag[f'enc{i}_s_norm'] = enc_s.norm(dim=-1).mean().item()
+            if not self.use_tp_fusion:
+                for i, enc_s in enumerate(enc_s_list):
+                    diag[f'enc{i}_s_norm'] = enc_s.norm(dim=-1).mean().item()
 
             # Decoder output scalar norm (post-final_norm)
             diag['s_out_norm'] = s_out.norm(dim=-1).mean().item()
@@ -465,17 +477,7 @@ class SE3PartSegNet(nn.Module):
 
             diag.update(self.get_pool_attn_stats())
 
-            # ── Multi-scale Head (same logic as forward) ──
-            global_feats = []
-            for enc_s, enc_ptr in zip(enc_s_list, enc_ptr_list):
-                B_enc = enc_ptr.shape[0] - 1
-                enc_counts = enc_ptr[1:] - enc_ptr[:-1]
-                enc_batch = torch.arange(B_enc, device=device).repeat_interleave(enc_counts)
-                shape_sum = torch.zeros(B_enc, self.hidden_scalar, device=device, dtype=enc_s.dtype)
-                shape_sum.scatter_add_(0, enc_batch.unsqueeze(1).expand_as(enc_s), enc_s)
-                shape_mean = shape_sum / enc_counts.unsqueeze(1).clamp(min=1).to(enc_s.dtype)
-                global_feats.append(shape_mean)
-
+            # ── Build head input (same as forward) ──
             sizes = ptr[1:] - ptr[:-1]
             point_cat_batch = torch.arange(B, device=device).repeat_interleave(sizes)
             point_cat = cat_indices[point_cat_batch]
@@ -483,10 +485,20 @@ class SE3PartSegNet(nn.Module):
             one_hot = torch.zeros(N, self.num_categories, device=device, dtype=s_out.dtype)
             one_hot.scatter_(1, point_cat.unsqueeze(1), 1.0)
 
-            point_globals = [g[point_cat_batch] for g in global_feats]
-            multi_scale = torch.cat(point_globals, dim=-1)
+            if not self.use_tp_fusion:
+                global_feats = []
+                for enc_s, enc_ptr in zip(enc_s_list, enc_ptr_list):
+                    B_enc = enc_ptr.shape[0] - 1
+                    enc_counts = enc_ptr[1:] - enc_ptr[:-1]
+                    enc_batch = torch.arange(B_enc, device=device).repeat_interleave(enc_counts)
+                    shape_sum = torch.zeros(B_enc, self.hidden_scalar, device=device, dtype=enc_s.dtype)
+                    shape_sum.scatter_add_(0, enc_batch.unsqueeze(1).expand_as(enc_s), enc_s)
+                    shape_mean = shape_sum / enc_counts.unsqueeze(1).clamp(min=1).to(enc_s.dtype)
+                    global_feats.append(shape_mean)
+                point_globals = [g[point_cat_batch] for g in global_feats]
+                multi_scale = torch.cat(point_globals, dim=-1)
 
-            # ── 6. Invariant feature extraction (same as forward) ──
+            # ── Invariant feature extraction ──
             head_parts = [s_out]
 
             # Vector invariant: ||v_c|| → learned projection → LayerNorm
@@ -497,8 +509,6 @@ class SE3PartSegNet(nn.Module):
             # Vector invariant diagnostics
             diag['v_inv_norm'] = v_inv.norm(dim=-1).mean().item()
             diag['v_inv_std'] = v_inv.std(dim=0).mean().item()
-            # v_utilization: ratio of v_inv contribution to head input
-            # Higher = vector features contributing more to predictions
             diag['head_in_dim'] = self._head_in_dim
 
             if t2_out is not None and self.hidden_type2 > 0:
@@ -507,12 +517,14 @@ class SE3PartSegNet(nn.Module):
                 head_parts.append(t2_inv)
                 diag['t2_inv_norm'] = t2_inv.norm(dim=-1).mean().item()
                 diag['t2_inv_std'] = t2_inv.std(dim=0).mean().item()
-            head_parts.extend([multi_scale, one_hot])
+
+            if not self.use_tp_fusion:
+                head_parts.append(multi_scale)
+            head_parts.append(one_hot)
 
             head_input = torch.cat(head_parts, dim=1)
 
             # Head contribution ratio: how much does t2_inv contribute?
-            # ||t2_inv|| / ||head_input|| — if this collapse → 0, model ignores t2.
             if t2_out is not None and self.hidden_type2 > 0:
                 diag['head_t2_ratio'] = (
                     t2_inv.norm(dim=-1).mean().item()

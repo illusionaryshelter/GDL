@@ -316,11 +316,25 @@ class EquivariantSkipFusion(nn.Module):
             fine_expanded = fine_pos_f.unsqueeze(1).expand(-1, K, -1)  # [N_fine, K, 3]
             coarse_gathered = coarse_pos_f[safe_idx]  # [N_fine, K, 3]
             edge_vec = fine_expanded - coarse_gathered  # [N_fine, K, 3]
-            edge_dist = edge_vec.norm(dim=-1).clamp(min=1e-8)  # [N_fine, K]
+            raw_edge_dist = edge_vec.norm(dim=-1)  # [N_fine, K] — true distance
+
+            # Degenerate edge detection (Rule 4: numerical stability).
+            # FPS coarse points are a subset of fine points, so some edges
+            # have exactly zero distance.  For these self-loop edges:
+            #   (a) The direction is undefined → SH produces a spurious
+            #       non-zero Y_2^0 that does NOT transform under D^2(R),
+            #       breaking t2 equivariance.
+            #   (b) Inverse-distance weights blow up to 1/ε.
+            # Fix: mark them as degenerate and exclude from SH / weighting.
+            _EPS_DEGEN = 1e-6
+            degenerate_mask = raw_edge_dist < _EPS_DEGEN  # [N_fine, K]
+
+            edge_dist = raw_edge_dist.clamp(min=_EPS_DEGEN)  # [N_fine, K]
             edge_dir = edge_vec / edge_dist.unsqueeze(-1)  # [N_fine, K, 3]
 
-            # Zero out invalid edges
-            edge_dir = edge_dir.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
+            # Zero out invalid AND degenerate edges
+            suppress_mask = ~valid_mask | degenerate_mask  # [N_fine, K]
+            edge_dir = edge_dir.masked_fill(suppress_mask.unsqueeze(-1), 0.0)
             edge_dist = edge_dist.masked_fill(~valid_mask, 0.0)
 
             # Flatten for TP computation
@@ -332,6 +346,13 @@ class EquivariantSkipFusion(nn.Module):
             Y = spherical_harmonics(edge_dir_flat, max_l=2)  # [E, 9]
             Y_0 = Y[:, 0:1]  # [E, 1]
             Y_2 = Y[:, 4:9] if has_t2 else None  # [E, 5] or None
+
+            # Zero out SH for degenerate edges: their directions are
+            # undefined so Y_l(d̂) is meaningless and non-equivariant.
+            suppress_flat = suppress_mask.reshape(E)
+            Y_0 = Y_0.masked_fill(suppress_flat.unsqueeze(-1), 0.0)
+            if Y_2 is not None:
+                Y_2 = Y_2.masked_fill(suppress_flat.unsqueeze(-1), 0.0)
 
             # ── 3. Gather coarse source features ──
             s_src = s_coarse_f[safe_idx.reshape(-1)].reshape(E, -1)  # [E, C_s]
@@ -385,8 +406,17 @@ class EquivariantSkipFusion(nn.Module):
             s_msg = s_msg.reshape(N_fine, K, self.scalar_channels)
             v_msg = v_msg.reshape(N_fine, K, self.vector_channels, 3)
 
-            # Inverse-distance weights for aggregation
-            inv_dist = 1.0 / edge_dist.clamp(min=1e-6)  # [N_fine, K]
+            # Softened inverse-distance weights for aggregation.
+            # Use 1/(d + σ) instead of 1/clamp(d, ε) so that:
+            #   • self-loop (d=0) edges get weight 1/σ (bounded, not 1e6)
+            #   • σ is set to median edge distance for scale invariance
+            # Self-loop features are still propagated (scalar & pass-through
+            # t2 via Path 6 are unaffected), but the direction-dependent
+            # SH paths (which are zero-masked for degenerate edges) no longer
+            # dominate the aggregation.
+            valid_dists = edge_dist.masked_fill(~valid_mask | degenerate_mask, float('inf'))
+            sigma = valid_dists.median().clamp(min=_EPS_DEGEN)  # characteristic scale
+            inv_dist = 1.0 / (edge_dist + sigma)  # [N_fine, K]
             inv_dist = inv_dist.masked_fill(~valid_mask, 0.0)
             weight_sum = inv_dist.sum(dim=-1, keepdim=True).clamp(min=1e-8)
             agg_weights = inv_dist / weight_sum  # [N_fine, K]
